@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Workbook Parse API", version="1.1.1")
+app = FastAPI(title="Workbook Parse API", version="1.2.1")
 
 # =========================
 # 内存存储（单机版）
@@ -120,6 +120,11 @@ def is_blank_name(name: Any) -> bool:
     return safe_str(name) == ""
 
 
+def truthy_flag(v: Any) -> bool:
+    s = safe_str(v).lower()
+    return s in {"1", "y", "yes", "true", "是", "阶梯", "阶梯提点"}
+
+
 # =========================
 # 字段角色识别工具
 # =========================
@@ -146,6 +151,11 @@ def is_threshold_max_field(name: str) -> bool:
 def is_time_like_field(name: str) -> bool:
     n = normalize_name(name)
     return any(k in n for k in ["年月", "日期", "时间", "month", "date", "期间", "统计月"])
+
+
+def is_ladder_flag_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["是否阶梯", "阶梯提点", "是否阶梯提点", "ladder", "isladder"])
 
 
 # =========================
@@ -258,7 +268,7 @@ def infer_grain_candidates(header: List[str]) -> List[List[str]]:
     candidates = []
 
     preferred = []
-    for key in ["统计年月", "年月", "工号", "uid", "收入类型", "产品线名称", "产品类型名称"]:
+    for key in ["统计年月", "年月", "工号", "uid", "收入类型", "产品线名称", "产品类型名称", "提点产品线名称"]:
         nk = normalize_name(key)
         if nk in header_norm_map:
             preferred.append(header_norm_map[nk])
@@ -408,6 +418,7 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
         min_field = None
         max_field = None
         output_field = None
+        ladder_flag_field = None
 
         for h in header:
             hn = normalize_name(h)
@@ -429,18 +440,26 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
             ]):
                 output_field = h
 
+            if ladder_flag_field is None and any(k in hn for k in [
+                "是否阶梯", "阶梯提点", "是否阶梯提点", "ladder", "isladder"
+            ]):
+                ladder_flag_field = h
+
         match_keys = []
-        excluded = {start_field, end_field, min_field, max_field, output_field, None, ""}
+        excluded = {
+            start_field, end_field, min_field, max_field, output_field,
+            ladder_flag_field, None, ""
+        }
         for h in header:
             if h in excluded:
                 continue
             match_keys.append(h)
 
         has_effective = start_field is not None and end_field is not None
-        has_ladder = min_field is not None and max_field is not None
+        has_threshold = min_field is not None or max_field is not None
         has_output = output_field is not None
 
-        if has_ladder and has_output:
+        if has_output and (has_threshold or ladder_flag_field is not None):
             threshold_base_field = None
             for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
                 picked = pick(header, c)
@@ -450,18 +469,20 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
 
             rules.append({
                 "rule_id": f"rule_{rule_idx:03d}",
-                "rule_name": f"{normalize_name(sheet_name)}_ladder",
+                "rule_name": f"{normalize_name(sheet_name)}_productline_rate",
                 "source_sheet": sheet_name,
-                "rule_type": "ladder_lookup",
+                "rule_type": "productline_rate_lookup",
                 "match_keys": match_keys[:3],
                 "date_field": "统计年月",
                 "effective_start_field": start_field,
                 "effective_end_field": end_field,
+                "ladder_flag_field": ladder_flag_field,
                 "threshold_min_field": min_field,
                 "threshold_max_field": max_field,
                 "threshold_base_field": threshold_base_field,
                 "output_field": output_field,
-                "confidence": 0.92 if has_effective else 0.85
+                "extra_output_fields": [x for x in [ladder_flag_field, min_field, max_field] if x],
+                "confidence": 0.93 if ladder_flag_field else 0.88
             })
             rule_idx += 1
             continue
@@ -532,7 +553,7 @@ def validate_fields_exist(
 
 
 def infer_rule_action(rule_type: str) -> str:
-    if rule_type in {"effective_lookup", "ladder_lookup", "lookup"}:
+    if rule_type in {"effective_lookup", "ladder_lookup", "lookup", "productline_rate_lookup"}:
         return rule_type
     return "rule"
 
@@ -697,6 +718,8 @@ def validate_model_request(
         threshold_min_field = rule.get("threshold_min_field")
         threshold_max_field = rule.get("threshold_max_field")
         threshold_base_field = rule.get("threshold_base_field")
+        ladder_flag_field = rule.get("ladder_flag_field")
+        extra_output_fields = rule.get("extra_output_fields", [])
 
         if not rule.get("rule_name"):
             errors.append(f"rules[{i}] 缺少 rule_name")
@@ -730,14 +753,14 @@ def validate_model_request(
                     f"rules[{i}].output_field"
                 )
 
-            extra_fields = [x for x in [effective_start_field, effective_end_field] if x]
+            extra_fields = [x for x in [effective_start_field, effective_end_field, ladder_flag_field] if x]
             if extra_fields:
                 validate_fields_exist(
                     source_sheet,
                     extra_fields,
                     field_index,
                     errors,
-                    f"rules[{i}].effective_fields"
+                    f"rules[{i}].effective_or_flag_fields"
                 )
 
             ladder_fields = [x for x in [threshold_min_field, threshold_max_field, threshold_base_field] if x]
@@ -750,16 +773,28 @@ def validate_model_request(
                     f"rules[{i}].threshold_fields"
                 )
 
-        if rule_type == "ladder_lookup":
-            if not threshold_min_field or not threshold_max_field:
-                errors.append(f"rules[{i}] rule_type=ladder_lookup 时必须提供 threshold_min_field 和 threshold_max_field")
+            if extra_output_fields:
+                validate_fields_exist(
+                    source_sheet,
+                    [x for x in extra_output_fields if x],
+                    field_index,
+                    errors,
+                    f"rules[{i}].extra_output_fields"
+                )
 
         if rule_type == "effective_lookup":
             if not effective_start_field or not effective_end_field:
                 errors.append(f"rules[{i}] rule_type=effective_lookup 时必须提供 effective_start_field 和 effective_end_field")
 
+        if rule_type in {"ladder_lookup", "productline_rate_lookup"}:
+            if not output_field:
+                errors.append(f"rules[{i}] {rule_type} 时必须提供 output_field")
+
         if output_field:
             available_fields.add(output_field)
+        for f in extra_output_fields:
+            if f:
+                available_fields.add(f)
 
     for i, formula in enumerate(formulas, start=1):
         output_field = formula.get("output_field")
@@ -947,6 +982,36 @@ def safe_formula_eval(df: pd.DataFrame, expression: str) -> pd.Series:
     return eval(expr, allowed_globals, {})
 
 
+def filter_by_ladder_bounds(
+        df: pd.DataFrame,
+        base_value: Any,
+        threshold_min_field: Optional[str],
+        threshold_max_field: Optional[str],
+) -> pd.DataFrame:
+    numeric_base = pd.to_numeric(pd.Series([base_value]), errors="coerce").iloc[0]
+    if pd.isna(numeric_base):
+        return df.iloc[0:0].copy()
+
+    min_series = (
+        pd.to_numeric(df[threshold_min_field], errors="coerce")
+        if threshold_min_field and threshold_min_field in df.columns
+        else pd.Series([np.nan] * len(df), index=df.index)
+    )
+    max_series = (
+        pd.to_numeric(df[threshold_max_field], errors="coerce")
+        if threshold_max_field and threshold_max_field in df.columns
+        else pd.Series([np.nan] * len(df), index=df.index)
+    )
+
+    # 业务规则：
+    # 1. 有阶梯上限：base > 上限 才命中
+    # 2. 有阶梯下限：base <= 下限 才命中
+    cond_upper = max_series.isna() | (numeric_base > max_series)
+    cond_lower = min_series.isna() | (numeric_base <= min_series)
+
+    return df[cond_upper & cond_lower]
+
+
 def execute_lookup(
         fact_df: pd.DataFrame,
         frames: Dict[str, pd.DataFrame],
@@ -1090,8 +1155,8 @@ def execute_ladder_lookup(
     if not output_field:
         raise ValueError("ladder_lookup 缺少 output_field")
 
-    if not threshold_min_field or not threshold_max_field:
-        raise ValueError("ladder_lookup 缺少 threshold_min_field 或 threshold_max_field")
+    if not threshold_min_field and not threshold_max_field:
+        raise ValueError("ladder_lookup 至少需要 threshold_min_field 或 threshold_max_field")
 
     if output_field not in fact_df.columns:
         fact_df[output_field] = np.nan
@@ -1100,7 +1165,7 @@ def execute_ladder_lookup(
     rule_start = ensure_datetime_column(rule_df, start_field)
     rule_end = ensure_datetime_column(rule_df, end_field)
 
-    if not threshold_base_field:
+    if not threshold_base_field or threshold_base_field not in fact_df.columns:
         candidates = ["奖金计算基数", "业绩", "金额", "收入", "base"]
         for c in candidates:
             if c in fact_df.columns:
@@ -1125,12 +1190,12 @@ def execute_ladder_lookup(
         if pd.notna(current_date) and start_field and end_field:
             matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
 
-        if threshold_min_field in matched.columns and threshold_max_field in matched.columns:
-            base_value = pd.to_numeric(pd.Series([fact_df.at[idx, threshold_base_field]]), errors="coerce").iloc[0]
-            matched = matched[
-                (pd.to_numeric(matched[threshold_min_field], errors="coerce") <= base_value) &
-                (pd.to_numeric(matched[threshold_max_field], errors="coerce") >= base_value)
-                ]
+        matched = filter_by_ladder_bounds(
+            matched,
+            fact_df.at[idx, threshold_base_field],
+            threshold_min_field,
+            threshold_max_field,
+        )
 
         if len(matched) > 0 and output_field in matched.columns:
             fact_df.at[idx, output_field] = matched.iloc[0][output_field]
@@ -1140,13 +1205,144 @@ def execute_ladder_lookup(
         logic_parts.append(" + ".join(match_keys))
     if start_field and end_field:
         logic_parts.append("生效失效区间")
-    logic_parts.append(f"阶梯规则({threshold_base_field})")
+    if threshold_max_field:
+        logic_parts.append(f"{threshold_base_field} > {threshold_max_field}")
+    if threshold_min_field:
+        logic_parts.append(f"{threshold_base_field} <= {threshold_min_field}")
 
     lineage.append({
         "field": output_field,
         "source_sheet": source_sheet,
         "logic": " + ".join(logic_parts)
     })
+
+    return fact_df
+
+
+def execute_productline_rate_lookup(
+        fact_df: pd.DataFrame,
+        frames: Dict[str, pd.DataFrame],
+        rule: Dict[str, Any],
+        lineage: List[Dict[str, Any]],
+) -> pd.DataFrame:
+    source_sheet = rule["source_sheet"]
+    if source_sheet not in frames:
+        raise ValueError(f"productline_rate_lookup 源 sheet 不存在: {source_sheet}")
+
+    rule_df = frames[source_sheet].copy()
+
+    match_keys = rule.get("match_keys", [])
+    date_field = rule.get("date_field")
+    start_field = rule.get("effective_start_field")
+    end_field = rule.get("effective_end_field")
+    ladder_flag_field = rule.get("ladder_flag_field")
+    threshold_min_field = rule.get("threshold_min_field")
+    threshold_max_field = rule.get("threshold_max_field")
+    threshold_base_field = rule.get("threshold_base_field")
+    output_field = rule.get("output_field")
+    extra_output_fields = rule.get("extra_output_fields", []) or []
+
+    if not output_field:
+        raise ValueError("productline_rate_lookup 缺少 output_field")
+
+    for col in [output_field] + extra_output_fields:
+        if col and col not in fact_df.columns:
+            fact_df[col] = np.nan
+
+    fact_dates = ensure_datetime_column(fact_df, date_field)
+    rule_start = ensure_datetime_column(rule_df, start_field) if start_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
+    rule_end = ensure_datetime_column(rule_df, end_field) if end_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
+
+    if not threshold_base_field or threshold_base_field not in fact_df.columns:
+        for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
+            if c in fact_df.columns:
+                threshold_base_field = c
+                break
+
+    for idx in fact_df.index:
+        matched = rule_df.copy()
+
+        # 1. 先按产品线名称等维度匹配
+        for key in match_keys:
+            if key not in fact_df.columns or key not in matched.columns:
+                continue
+            matched = matched[
+                normalize_join_key_series(matched[key]) ==
+                safe_str(fact_df.at[idx, key])
+                ]
+
+        # 2. 再按生效失效区间过滤
+        current_date = fact_dates.loc[idx]
+        if pd.notna(current_date) and start_field and end_field:
+            matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
+
+        if matched.empty:
+            continue
+
+        selected = None
+
+        # 3. 判断是否阶梯提点
+        if ladder_flag_field and ladder_flag_field in matched.columns:
+            ladder_rows = matched[matched[ladder_flag_field].apply(truthy_flag)]
+            non_ladder_rows = matched[~matched[ladder_flag_field].apply(truthy_flag)]
+        else:
+            ladder_rows = matched
+            non_ladder_rows = pd.DataFrame(columns=matched.columns)
+
+        # 4. 若为阶梯提点，则按新的上限/下限规则命中
+        if not ladder_rows.empty and threshold_base_field and threshold_base_field in fact_df.columns:
+            ladder_hit = filter_by_ladder_bounds(
+                ladder_rows,
+                fact_df.at[idx, threshold_base_field],
+                threshold_min_field,
+                threshold_max_field,
+            )
+            if not ladder_hit.empty:
+                selected = ladder_hit.iloc[0]
+
+        # 5. 若不是阶梯或阶梯没命中，则取非阶梯记录
+        if selected is None and not non_ladder_rows.empty:
+            selected = non_ladder_rows.iloc[0]
+
+        # 6. 最后兜底
+        if selected is None and not matched.empty:
+            selected = matched.iloc[0]
+
+        if selected is None:
+            continue
+
+        if output_field in selected.index:
+            fact_df.at[idx, output_field] = selected[output_field]
+
+        for col in extra_output_fields:
+            if col in selected.index:
+                fact_df.at[idx, col] = selected[col]
+
+    logic_parts = []
+    if match_keys:
+        logic_parts.append(f"按{'+'.join(match_keys)}匹配产品线规则")
+    if start_field and end_field:
+        logic_parts.append("按生效失效区间过滤")
+    if ladder_flag_field:
+        logic_parts.append(f"依据{ladder_flag_field}判断是否阶梯提点")
+    if threshold_max_field and threshold_base_field:
+        logic_parts.append(f"若有{threshold_max_field}则要求{threshold_base_field}>{threshold_max_field}")
+    if threshold_min_field and threshold_base_field:
+        logic_parts.append(f"若有{threshold_min_field}则要求{threshold_base_field}<={threshold_min_field}")
+    logic_parts.append(f"输出{output_field}")
+
+    lineage.append({
+        "field": output_field,
+        "source_sheet": source_sheet,
+        "logic": "；".join(logic_parts)
+    })
+
+    for col in extra_output_fields:
+        lineage.append({
+            "field": col,
+            "source_sheet": source_sheet,
+            "logic": f"按产品线规则回填{col}"
+        })
 
     return fact_df
 
@@ -1707,6 +1903,8 @@ async def execute_calculation(payload: Dict[str, Any]):
                 fact_df = execute_effective_lookup(fact_df, frames, config, lineage)
             elif action == "ladder_lookup":
                 fact_df = execute_ladder_lookup(fact_df, frames, config, lineage)
+            elif action == "productline_rate_lookup":
+                fact_df = execute_productline_rate_lookup(fact_df, frames, config, lineage)
             elif action == "formula":
                 fact_df = execute_formula(fact_df, config, lineage)
             else:

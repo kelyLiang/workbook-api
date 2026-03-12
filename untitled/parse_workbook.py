@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Workbook Parse API", version="1.2.1")
+app = FastAPI(title="Workbook Parse API", version="1.2.2")
 
 # =========================
 # 内存存储（单机版）
@@ -123,6 +123,14 @@ def is_blank_name(name: Any) -> bool:
 def truthy_flag(v: Any) -> bool:
     s = safe_str(v).lower()
     return s in {"1", "y", "yes", "true", "是", "阶梯", "阶梯提点"}
+
+
+def ensure_object_column(df: pd.DataFrame, col: str) -> None:
+    if col not in df.columns:
+        df[col] = pd.Series([None] * len(df), index=df.index, dtype="object")
+    else:
+        if df[col].dtype != "object":
+            df[col] = df[col].astype("object")
 
 
 # =========================
@@ -1091,8 +1099,7 @@ def execute_effective_lookup(
     if not output_field:
         raise ValueError("effective_lookup 缺少 output_field")
 
-    if output_field not in fact_df.columns:
-        fact_df[output_field] = np.nan
+    ensure_object_column(fact_df, output_field)
 
     fact_dates = ensure_datetime_column(fact_df, date_field)
     rule_start = ensure_datetime_column(rule_df, start_field)
@@ -1158,8 +1165,7 @@ def execute_ladder_lookup(
     if not threshold_min_field and not threshold_max_field:
         raise ValueError("ladder_lookup 至少需要 threshold_min_field 或 threshold_max_field")
 
-    if output_field not in fact_df.columns:
-        fact_df[output_field] = np.nan
+    ensure_object_column(fact_df, output_field)
 
     fact_dates = ensure_datetime_column(fact_df, date_field)
     rule_start = ensure_datetime_column(rule_df, start_field)
@@ -1246,8 +1252,8 @@ def execute_productline_rate_lookup(
         raise ValueError("productline_rate_lookup 缺少 output_field")
 
     for col in [output_field] + extra_output_fields:
-        if col and col not in fact_df.columns:
-            fact_df[col] = np.nan
+        if col:
+            ensure_object_column(fact_df, col)
 
     fact_dates = ensure_datetime_column(fact_df, date_field)
     rule_start = ensure_datetime_column(rule_df, start_field) if start_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)

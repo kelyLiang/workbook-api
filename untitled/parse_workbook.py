@@ -11,11 +11,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Workbook Parse API", version="1.0.0")
+app = FastAPI(title="Workbook Parse API", version="1.1.1")
 
 # =========================
 # 内存存储（单机版）
@@ -62,20 +61,50 @@ def safe_str(v: Any) -> str:
 
 
 def normalize_cell_value(v: Any) -> Any:
-    if isinstance(v, datetime):
+    if v is None:
+        return None
+
+    if isinstance(v, (pd.Timestamp, datetime)):
+        if pd.isna(v):
+            return None
         return v.strftime("%Y-%m-%d %H:%M:%S")
+
     if isinstance(v, date):
         return v.strftime("%Y-%m-%d")
+
+    if isinstance(v, (np.integer,)):
+        return int(v)
+
+    if isinstance(v, (np.floating, float)):
+        try:
+            if pd.isna(v) or math.isinf(float(v)):
+                return None
+        except Exception:
+            return None
+        return float(v)
+
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+
     return v
 
 
 def to_jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: to_jsonable(v) for k, v in value.items()}
+
     if isinstance(value, list):
         return [to_jsonable(v) for v in value]
+
     if isinstance(value, tuple):
         return [to_jsonable(v) for v in value]
+
     return normalize_cell_value(value)
 
 
@@ -85,6 +114,38 @@ def normalize_name(name: str) -> str:
 
 def is_empty_row(row: List[Any]) -> bool:
     return all(cell is None or safe_str(cell) == "" for cell in row)
+
+
+def is_blank_name(name: Any) -> bool:
+    return safe_str(name) == ""
+
+
+# =========================
+# 字段角色识别工具
+# =========================
+def is_effective_start_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["生效", "开始", "起始", "start", "from"])
+
+
+def is_effective_end_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["失效", "结束", "截止", "end", "to"])
+
+
+def is_threshold_min_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["下限", "最小", "min", "lower"])
+
+
+def is_threshold_max_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["上限", "最大", "max", "upper"])
+
+
+def is_time_like_field(name: str) -> bool:
+    n = normalize_name(name)
+    return any(k in n for k in ["年月", "日期", "时间", "month", "date", "期间", "统计月"])
 
 
 # =========================
@@ -160,7 +221,7 @@ def infer_semantic_type(col_name: str, data_type: str) -> str:
 
     if any(k in name for k in ["年月", "日期", "时间", "month", "date", "期间", "统计月"]):
         return "time"
-    if any(k in name for k in ["金额", "收入", "奖金", "提点率", "率", "下限", "上限", "base", "metric"]):
+    if any(k in name for k in ["金额", "收入", "奖金", "提点率", "提点系数", "率", "下限", "上限", "base", "metric"]):
         return "metric"
     if any(k in name for k in ["工号", "uid", "id", "编码", "编号", "key"]):
         return "identifier"
@@ -169,19 +230,21 @@ def infer_semantic_type(col_name: str, data_type: str) -> str:
 
 def infer_sheet_role(sheet_name: str, header: List[str], data_rows: List[List[Any]]) -> Tuple[str, float]:
     name = normalize_name(sheet_name)
-    header_norm = [normalize_name(h) for h in header]
+    clean_header = [h for h in header if safe_str(h)]
 
     if "逻辑" in name or "说明" in name or "分析" in name or "instruction" in name:
         return "instruction", 0.97
 
-    if "mapping" in name or "关系" in name or "lookup" in name:
-        if any(x in header_norm for x in ["下限", "上限", "threshold_min", "threshold_max"]):
+    if "mapping" in name or "关系" in name or "lookup" in name or "rule" in name:
+        if any(is_threshold_min_field(h) or is_threshold_max_field(h) for h in clean_header):
+            return "rule", 0.90
+        if any(is_effective_start_field(h) or is_effective_end_field(h) for h in clean_header):
             return "rule", 0.88
         return "dimension", 0.92
 
     large_rows = len(data_rows) >= 50
-    has_time = any("年月" in h or "日期" in h or "month" in h.lower() for h in header)
-    has_metric = any(("金额" in h or "收入" in h or "奖金" in h or "基数" in h) for h in header)
+    has_time = any(is_time_like_field(h) for h in clean_header)
+    has_metric = any(("金额" in h or "收入" in h or "奖金" in h or "基数" in h) for h in clean_header)
 
     if large_rows and has_time and has_metric:
         return "fact", 0.96
@@ -190,7 +253,8 @@ def infer_sheet_role(sheet_name: str, header: List[str], data_rows: List[List[An
 
 
 def infer_grain_candidates(header: List[str]) -> List[List[str]]:
-    header_norm_map = {normalize_name(h): h for h in header}
+    clean_header = [h for h in header if safe_str(h)]
+    header_norm_map = {normalize_name(h): h for h in clean_header}
     candidates = []
 
     preferred = []
@@ -204,7 +268,7 @@ def infer_grain_candidates(header: List[str]) -> List[List[str]]:
 
     if not candidates:
         dims = []
-        for h in header:
+        for h in clean_header:
             nh = normalize_name(h)
             if any(k in nh for k in ["工号", "uid", "id", "类型", "名称", "年月", "日期"]):
                 dims.append(h)
@@ -214,9 +278,9 @@ def infer_grain_candidates(header: List[str]) -> List[List[str]]:
     return candidates
 
 
-def summarize_instruction_sheet(data_rows: List[List[Any]], max_chars: int = 120) -> str:
+def summarize_instruction_sheet(data_rows: List[List[Any]], max_chars: int = 300) -> str:
     texts = []
-    for row in data_rows[:50]:
+    for row in data_rows[:100]:
         row_text = " ".join([safe_str(x) for x in row if safe_str(x)])
         if row_text:
             texts.append(row_text)
@@ -240,6 +304,9 @@ def build_sheet_profile(ws: Worksheet, preview_rows: int) -> Dict[str, Any]:
 
     columns = []
     for idx, col_name in enumerate(header):
+        if not safe_str(col_name):
+            continue
+
         sample_vals = preview_values(data_rows[:preview_rows], idx, 2)
         data_type = infer_data_type(sample_vals if sample_vals else [])
         semantic_type = infer_semantic_type(col_name, data_type)
@@ -265,9 +332,11 @@ def build_sheet_profile(ws: Worksheet, preview_rows: int) -> Dict[str, Any]:
 
 
 def find_same_named_columns(from_header: List[str], to_header: List[str]) -> List[Tuple[str, str]]:
-    to_norm_map = {normalize_name(c): c for c in to_header}
+    to_norm_map = {normalize_name(c): c for c in to_header if safe_str(c)}
     matches = []
     for col in from_header:
+        if not safe_str(col):
+            continue
         n = normalize_name(col)
         if n in to_norm_map:
             matches.append((col, to_norm_map[n]))
@@ -282,20 +351,21 @@ def infer_relationships(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str, 
     dims = [s for s in sheet_profiles if s["candidate_role"] in ("dimension", "rule")]
 
     for fact in facts:
-        fact_header = fact["_header"]
+        fact_header = [h for h in fact["_header"] if safe_str(h)]
 
         for dim in dims:
-            dim_header = dim["_header"]
+            dim_header = [h for h in dim["_header"] if safe_str(h)]
             matches = find_same_named_columns(fact_header, dim_header)
 
             if not matches:
                 continue
 
             keys = [{"from_field": a, "to_field": b} for a, b in matches[:3]]
+            matched_target_fields = {m[1] for m in matches}
 
             output_fields = [
                                 c for c in dim_header
-                                if c not in [m[1] for m in matches]
+                                if safe_str(c) and c not in matched_target_fields
                             ][:3]
 
             confidence = min(0.75 + 0.08 * len(matches), 0.97)
@@ -319,66 +389,97 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
     rules = []
     rule_idx = 1
 
+    def pick(header: List[str], *cands: str) -> Optional[str]:
+        norm_map = {normalize_name(h): h for h in header if safe_str(h)}
+        for c in cands:
+            nc = normalize_name(c)
+            if nc in norm_map:
+                return norm_map[nc]
+        return None
+
     for s in sheet_profiles:
         sheet_name = s["sheet_name"]
-        header = s["_header"]
-        header_norm = [normalize_name(h) for h in header]
+        header = [h for h in s["_header"] if safe_str(h)]
+        if not header:
+            continue
 
-        def pick(*cands: str) -> Optional[str]:
-            norm_map = {normalize_name(h): h for h in header}
-            for c in cands:
-                if normalize_name(c) in norm_map:
-                    return norm_map[normalize_name(c)]
-            return None
+        start_field = None
+        end_field = None
+        min_field = None
+        max_field = None
+        output_field = None
 
-        date_field = "统计年月"
+        for h in header:
+            hn = normalize_name(h)
 
-        has_effective = ("生效月" in header_norm and "失效月" in header_norm)
-        has_rate = any(("提点率" in h or re.search(r"rate", h, re.I)) for h in header)
+            if start_field is None and any(k in hn for k in ["生效", "开始", "起始", "start", "from"]):
+                start_field = h
 
-        if has_effective and has_rate:
-            output_field = None
-            for h in header:
-                if "提点率" in h or re.search(r"rate", h, re.I):
-                    output_field = h
+            if end_field is None and any(k in hn for k in ["失效", "结束", "截止", "end", "to"]):
+                end_field = h
+
+            if min_field is None and any(k in hn for k in ["下限", "最小", "min", "lower"]):
+                min_field = h
+
+            if max_field is None and any(k in hn for k in ["上限", "最大", "max", "upper"]):
+                max_field = h
+
+            if output_field is None and any(k in hn for k in [
+                "提点率", "提点系数", "系数", "费率", "比例", "rate", "factor", "coef"
+            ]):
+                output_field = h
+
+        match_keys = []
+        excluded = {start_field, end_field, min_field, max_field, output_field, None, ""}
+        for h in header:
+            if h in excluded:
+                continue
+            match_keys.append(h)
+
+        has_effective = start_field is not None and end_field is not None
+        has_ladder = min_field is not None and max_field is not None
+        has_output = output_field is not None
+
+        if has_ladder and has_output:
+            threshold_base_field = None
+            for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
+                picked = pick(header, c)
+                if picked:
+                    threshold_base_field = picked
                     break
 
-            match_keys = []
-            for key in ["收入类型", "提点产品线名称", "产品线名称", "产品类型名称"]:
-                selected = pick(key)
-                if selected:
-                    match_keys.append(selected)
+            rules.append({
+                "rule_id": f"rule_{rule_idx:03d}",
+                "rule_name": f"{normalize_name(sheet_name)}_ladder",
+                "source_sheet": sheet_name,
+                "rule_type": "ladder_lookup",
+                "match_keys": match_keys[:3],
+                "date_field": "统计年月",
+                "effective_start_field": start_field,
+                "effective_end_field": end_field,
+                "threshold_min_field": min_field,
+                "threshold_max_field": max_field,
+                "threshold_base_field": threshold_base_field,
+                "output_field": output_field,
+                "confidence": 0.92 if has_effective else 0.85
+            })
+            rule_idx += 1
+            continue
 
-            if "下限" in header_norm or "上限" in header_norm:
-                rules.append({
-                    "rule_id": f"rule_{rule_idx:03d}",
-                    "rule_name": f"{normalize_name(sheet_name)}_ladder",
-                    "source_sheet": sheet_name,
-                    "rule_type": "ladder_lookup",
-                    "match_keys": match_keys[:2] or ["unknown_key"],
-                    "date_field": date_field,
-                    "effective_start_field": pick("生效月") or "生效月",
-                    "effective_end_field": pick("失效月") or "失效月",
-                    "threshold_min_field": pick("下限") or "下限",
-                    "threshold_max_field": pick("上限") or "上限",
-                    "output_field": output_field or "提点率",
-                    "confidence": 0.92
-                })
-                rule_idx += 1
-            else:
-                rules.append({
-                    "rule_id": f"rule_{rule_idx:03d}",
-                    "rule_name": f"{normalize_name(sheet_name)}_lookup",
-                    "source_sheet": sheet_name,
-                    "rule_type": "effective_lookup",
-                    "match_keys": match_keys[:2] or ["unknown_key"],
-                    "date_field": date_field,
-                    "effective_start_field": pick("生效月") or "生效月",
-                    "effective_end_field": pick("失效月") or "失效月",
-                    "output_field": output_field or "提点率",
-                    "confidence": 0.95
-                })
-                rule_idx += 1
+        if has_effective and has_output:
+            rules.append({
+                "rule_id": f"rule_{rule_idx:03d}",
+                "rule_name": f"{normalize_name(sheet_name)}_lookup",
+                "source_sheet": sheet_name,
+                "rule_type": "effective_lookup",
+                "match_keys": match_keys[:3],
+                "date_field": "统计年月",
+                "effective_start_field": start_field,
+                "effective_end_field": end_field,
+                "output_field": output_field,
+                "confidence": 0.95
+            })
+            rule_idx += 1
 
     return rules
 
@@ -424,6 +525,8 @@ def validate_fields_exist(
 ) -> None:
     known_fields = field_index.get(sheet_name, set())
     for field in fields:
+        if not field:
+            continue
         if field not in known_fields:
             errors.append(f"{label} 字段不存在: sheet={sheet_name}, field={field}")
 
@@ -443,7 +546,7 @@ def build_plan_steps(
     step_no = 1
 
     for rel in relationships:
-        output_fields = rel.get("output_fields", [])
+        output_fields = [x for x in rel.get("output_fields", []) if safe_str(x)]
         target_name = "、".join(output_fields) if output_fields else rel.get("to_sheet", "关系映射")
         steps.append({
             "step_no": step_no,
@@ -528,7 +631,7 @@ def validate_model_request(
         from_sheet = rel.get("from_sheet")
         to_sheet = rel.get("to_sheet")
         keys = rel.get("keys", [])
-        output_fields = rel.get("output_fields", [])
+        output_fields = [x for x in rel.get("output_fields", []) if safe_str(x)]
 
         if not from_sheet:
             errors.append(f"relationships[{i}] 缺少 from_sheet")
@@ -577,6 +680,13 @@ def validate_model_request(
                 f"relationships[{i}].output_fields"
             )
 
+    available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
+
+    for rel in relationships:
+        for field in rel.get("output_fields", []):
+            if field:
+                available_fields.add(field)
+
     for i, rule in enumerate(rules, start=1):
         source_sheet = rule.get("source_sheet")
         rule_type = rule.get("rule_type")
@@ -586,6 +696,7 @@ def validate_model_request(
         effective_end_field = rule.get("effective_end_field")
         threshold_min_field = rule.get("threshold_min_field")
         threshold_max_field = rule.get("threshold_max_field")
+        threshold_base_field = rule.get("threshold_base_field")
 
         if not rule.get("rule_name"):
             errors.append(f"rules[{i}] 缺少 rule_name")
@@ -604,7 +715,7 @@ def validate_model_request(
         if source_sheet in known_sheets:
             validate_fields_exist(
                 source_sheet,
-                match_keys,
+                [x for x in match_keys if x],
                 field_index,
                 errors,
                 f"rules[{i}].match_keys"
@@ -629,7 +740,7 @@ def validate_model_request(
                     f"rules[{i}].effective_fields"
                 )
 
-            ladder_fields = [x for x in [threshold_min_field, threshold_max_field] if x]
+            ladder_fields = [x for x in [threshold_min_field, threshold_max_field, threshold_base_field] if x]
             if ladder_fields:
                 validate_fields_exist(
                     source_sheet,
@@ -647,14 +758,6 @@ def validate_model_request(
             if not effective_start_field or not effective_end_field:
                 errors.append(f"rules[{i}] rule_type=effective_lookup 时必须提供 effective_start_field 和 effective_end_field")
 
-    available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
-
-    for rel in relationships:
-        for field in rel.get("output_fields", []):
-            available_fields.add(field)
-
-    for rule in rules:
-        output_field = rule.get("output_field")
         if output_field:
             available_fields.add(output_field)
 
@@ -669,7 +772,7 @@ def validate_model_request(
 
         if expression:
             tokens = re.findall(r"[\u4e00-\u9fffA-Za-z_][\u4e00-\u9fffA-Za-z0-9_]*", expression)
-            reserved = {"and", "or", "not", "if", "else"}
+            reserved = {"and", "or", "not", "if", "else", "True", "False", "None"}
             referenced_fields = [t for t in tokens if t not in reserved]
 
             unknown_fields = [
@@ -703,21 +806,23 @@ def load_workbook_frames(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
 
     for ws in wb.worksheets:
         header, data_rows = detect_header_and_rows(ws)
-        if not header:
+        clean_header = [safe_str(h) for h in header if safe_str(h)]
+
+        if not clean_header:
             frames[ws.title] = pd.DataFrame()
             continue
+
+        keep_indices = [i for i, h in enumerate(header) if safe_str(h)]
 
         normalized_rows = []
         for row in data_rows:
             row = list(row)
-            if len(row) < len(header):
-                row = row + [None] * (len(header) - len(row))
-            elif len(row) > len(header):
-                row = row[:len(header)]
+            selected = []
+            for idx in keep_indices:
+                selected.append(row[idx] if idx < len(row) else None)
+            normalized_rows.append([normalize_cell_value(v) for v in selected])
 
-            normalized_rows.append([normalize_cell_value(v) for v in row])
-
-        df = pd.DataFrame(normalized_rows, columns=header)
+        df = pd.DataFrame(normalized_rows, columns=clean_header)
         frames[ws.title] = df
 
     return frames
@@ -748,8 +853,8 @@ def try_parse_period(v: Any) -> Any:
         return pd.NaT
 
 
-def ensure_datetime_column(df: pd.DataFrame, col: str) -> pd.Series:
-    if col not in df.columns:
+def ensure_datetime_column(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
+    if not col or col not in df.columns:
         return pd.Series([pd.NaT] * len(df), index=df.index)
     return df[col].apply(try_parse_period)
 
@@ -765,7 +870,7 @@ def infer_result_semantic_type(col_name: str, data_type: str) -> str:
         return "customer"
     if any(k in name for k in ["提点率", "费率", "rate"]):
         return "rate"
-    if any(k in name for k in ["金额", "收入", "奖金", "基数"]):
+    if any(k in name for k in ["金额", "收入", "奖金", "基数", "系数"]):
         return "metric"
     if data_type == "number":
         return "metric"
@@ -854,7 +959,7 @@ def execute_lookup(
 
     dim_df = frames[to_sheet].copy()
     keys = step_config.get("keys", [])
-    output_fields = step_config.get("output_fields", [])
+    output_fields = [x for x in step_config.get("output_fields", []) if safe_str(x)]
 
     if not keys:
         raise ValueError("lookup 缺少 keys")
@@ -875,7 +980,7 @@ def execute_lookup(
             raise ValueError(f"维表缺少关联字段: {col}")
         right[col] = normalize_join_key_series(right[col])
 
-    use_cols = list(dict.fromkeys(right_on + output_fields))
+    use_cols = [c for c in list(dict.fromkeys(right_on + output_fields)) if c in right.columns]
 
     merged = left.merge(
         right[use_cols],
@@ -940,16 +1045,22 @@ def execute_effective_lookup(
                 ]
 
         current_date = fact_dates.loc[idx]
-        if pd.notna(current_date):
+        if pd.notna(current_date) and start_field and end_field:
             matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
 
         if len(matched) > 0 and output_field in matched.columns:
             fact_df.at[idx, output_field] = matched.iloc[0][output_field]
 
+    logic_parts = []
+    if match_keys:
+        logic_parts.append(" + ".join(match_keys))
+    if start_field and end_field:
+        logic_parts.append("生效失效区间")
+
     lineage.append({
         "field": output_field,
         "source_sheet": source_sheet,
-        "logic": f"{' + '.join(match_keys)} + 生效失效月"
+        "logic": " + ".join(logic_parts) if logic_parts else "规则匹配"
     })
 
     return fact_df
@@ -973,10 +1084,14 @@ def execute_ladder_lookup(
     end_field = rule.get("effective_end_field")
     threshold_min_field = rule.get("threshold_min_field")
     threshold_max_field = rule.get("threshold_max_field")
+    threshold_base_field = rule.get("threshold_base_field")
     output_field = rule.get("output_field")
 
     if not output_field:
         raise ValueError("ladder_lookup 缺少 output_field")
+
+    if not threshold_min_field or not threshold_max_field:
+        raise ValueError("ladder_lookup 缺少 threshold_min_field 或 threshold_max_field")
 
     if output_field not in fact_df.columns:
         fact_df[output_field] = np.nan
@@ -985,12 +1100,15 @@ def execute_ladder_lookup(
     rule_start = ensure_datetime_column(rule_df, start_field)
     rule_end = ensure_datetime_column(rule_df, end_field)
 
-    threshold_base_field = None
-    candidates = ["奖金计算基数", "业绩", "金额", "收入", "base"]
-    for c in candidates:
-        if c in fact_df.columns:
-            threshold_base_field = c
-            break
+    if not threshold_base_field:
+        candidates = ["奖金计算基数", "业绩", "金额", "收入", "base"]
+        for c in candidates:
+            if c in fact_df.columns:
+                threshold_base_field = c
+                break
+
+    if not threshold_base_field or threshold_base_field not in fact_df.columns:
+        raise ValueError("ladder_lookup 无法确定 threshold_base_field，请在 rule config 中显式提供")
 
     for idx in fact_df.index:
         matched = rule_df.copy()
@@ -1004,10 +1122,10 @@ def execute_ladder_lookup(
                 ]
 
         current_date = fact_dates.loc[idx]
-        if pd.notna(current_date):
+        if pd.notna(current_date) and start_field and end_field:
             matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
 
-        if threshold_base_field and threshold_min_field in matched.columns and threshold_max_field in matched.columns:
+        if threshold_min_field in matched.columns and threshold_max_field in matched.columns:
             base_value = pd.to_numeric(pd.Series([fact_df.at[idx, threshold_base_field]]), errors="coerce").iloc[0]
             matched = matched[
                 (pd.to_numeric(matched[threshold_min_field], errors="coerce") <= base_value) &
@@ -1020,8 +1138,9 @@ def execute_ladder_lookup(
     logic_parts = []
     if match_keys:
         logic_parts.append(" + ".join(match_keys))
-    logic_parts.append("生效失效月")
-    logic_parts.append("阶梯规则")
+    if start_field and end_field:
+        logic_parts.append("生效失效区间")
+    logic_parts.append(f"阶梯规则({threshold_base_field})")
 
     lineage.append({
         "field": output_field,
@@ -1128,7 +1247,6 @@ def aggregate_df(df: pd.DataFrame, group_by: List[str], metrics: List[str]) -> p
 
     agg_map = {m: "sum" for m in valid_metrics}
 
-    # 先尽量转数值
     temp_df = df.copy()
     for m in valid_metrics:
         temp_df[m] = pd.to_numeric(temp_df[m], errors="coerce")
@@ -1431,50 +1549,55 @@ async def parse_workbook(
 
     warnings: List[str] = []
 
-    sheet_profiles: List[Dict[str, Any]] = []
-    instruction_extract: Dict[str, Any] = {
-        "has_instruction_sheet": False,
-        "sheet_name": None,
-        "text_summary": None
-    }
+    try:
+        sheet_profiles: List[Dict[str, Any]] = []
+        instruction_extract: Dict[str, Any] = {
+            "has_instruction_sheet": False,
+            "sheet_name": None,
+            "text_summary": None
+        }
 
-    for ws in wb.worksheets:
-        profile = build_sheet_profile(ws, preview_rows=preview_rows)
-        sheet_profiles.append(profile)
+        for ws in wb.worksheets:
+            profile = build_sheet_profile(ws, preview_rows=preview_rows)
+            sheet_profiles.append(profile)
 
-        if profile["candidate_role"] == "instruction":
-            instruction_extract["has_instruction_sheet"] = True
-            instruction_extract["sheet_name"] = ws.title
-            instruction_extract["text_summary"] = summarize_instruction_sheet(profile["_data_rows"])
+            if profile["candidate_role"] == "instruction":
+                instruction_extract["has_instruction_sheet"] = True
+                instruction_extract["sheet_name"] = ws.title
+                instruction_extract["text_summary"] = summarize_instruction_sheet(profile["_data_rows"])
 
-    candidate_relationships: List[Dict[str, Any]] = []
-    if detect_relationships:
-        candidate_relationships = infer_relationships(sheet_profiles)
+        candidate_relationships: List[Dict[str, Any]] = []
+        if detect_relationships:
+            candidate_relationships = infer_relationships(sheet_profiles)
 
-    candidate_rules: List[Dict[str, Any]] = []
-    if infer_rules_flag:
-        candidate_rules = infer_candidate_rules(sheet_profiles)
+        candidate_rules: List[Dict[str, Any]] = []
+        if infer_rules_flag:
+            candidate_rules = infer_candidate_rules(sheet_profiles)
 
-    if instruction:
-        warnings.append(f"已接收业务说明 instruction: {instruction[:80]}")
+        if instruction:
+            warnings.append(f"已接收业务说明 instruction: {instruction[:80]}")
 
-    response = {
-        "request_id": request_id,
-        "workbook": {
-            "file_id": file_id,
-            "file_name": file.filename,
-            "sheet_count": len(wb.sheetnames),
-            "sheet_names": wb.sheetnames
-        },
-        "sheets": cleanup_internal_fields(sheet_profiles),
-        "candidate_relationships": candidate_relationships,
-        "candidate_rules": candidate_rules,
-        "instruction_extract": instruction_extract,
-        "warnings": warnings
-    }
+        response = {
+            "request_id": request_id,
+            "workbook": {
+                "file_id": file_id,
+                "file_name": file.filename,
+                "sheet_count": len(wb.sheetnames),
+                "sheet_names": wb.sheetnames
+            },
+            "sheets": cleanup_internal_fields(sheet_profiles),
+            "candidate_relationships": candidate_relationships,
+            "candidate_rules": candidate_rules,
+            "instruction_extract": instruction_extract,
+            "warnings": warnings
+        }
 
-    PARSED_WORKBOOK_STORE[file_id] = to_jsonable(response)
-    return JSONResponse(content=to_jsonable(response))
+        response = to_jsonable(response)
+        PARSED_WORKBOOK_STORE[file_id] = response
+        return response
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"parse_workbook 处理失败: {str(e)}")
 
 
 # =========================
@@ -1518,6 +1641,8 @@ async def build_model(payload: Dict[str, Any]):
         "validation": validation
     }
 
+    response = to_jsonable(response)
+
     MODEL_STORE[model_id] = {
         "model_id": model_id,
         "file_id": file_id,
@@ -1525,7 +1650,7 @@ async def build_model(payload: Dict[str, Any]):
         "response": deepcopy(response)
     }
 
-    return JSONResponse(content=to_jsonable(response))
+    return response
 
 
 # =========================
@@ -1614,6 +1739,8 @@ async def execute_calculation(payload: Dict[str, Any]):
         "warnings": warnings
     }
 
+    result = to_jsonable(result)
+
     if execution_options.get("persist_result", True):
         record = {
             "job_id": job_id,
@@ -1622,12 +1749,12 @@ async def execute_calculation(payload: Dict[str, Any]):
             "model_id": model_id,
             "plan": deepcopy(plan),
             "result_df": fact_df.copy(),
-            "result": to_jsonable(result)
+            "result": deepcopy(result)
         }
         EXECUTION_STORE[job_id] = record
         DATASET_STORE[dataset_id] = record
 
-    return JSONResponse(content=to_jsonable(result))
+    return result
 
 
 # =========================
@@ -1678,7 +1805,7 @@ async def query_dataset(payload: Dict[str, Any]):
     else:
         raise HTTPException(status_code=400, detail=f"不支持的 intent: {intent}")
 
-    return JSONResponse(content=to_jsonable(response))
+    return to_jsonable(response)
 
 
 # =========================

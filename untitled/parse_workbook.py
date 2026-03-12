@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Workbook Parse API", version="1.2.2")
+app = FastAPI(title="Workbook Parse API", version="1.3.0")
 
 # =========================
 # 内存存储（单机版）
@@ -114,10 +114,6 @@ def normalize_name(name: str) -> str:
 
 def is_empty_row(row: List[Any]) -> bool:
     return all(cell is None or safe_str(cell) == "" for cell in row)
-
-
-def is_blank_name(name: Any) -> bool:
-    return safe_str(name) == ""
 
 
 def truthy_flag(v: Any) -> bool:
@@ -614,6 +610,51 @@ def build_plan_steps(
         step_no += 1
 
     return steps
+
+
+def infer_candidate_formulas(
+        main_fact_sheet: str,
+        relationships: List[Dict[str, Any]],
+        rules: List[Dict[str, Any]],
+        parsed_workbook: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    field_index = build_sheet_field_index(parsed_workbook)
+    available_fields = set(field_index.get(main_fact_sheet, set()))
+
+    for rel in relationships:
+        for field in rel.get("output_fields", []):
+            if field:
+                available_fields.add(field)
+
+    for rule in rules:
+        output_field = rule.get("output_field")
+        if output_field:
+            available_fields.add(output_field)
+
+        for field in rule.get("extra_output_fields", []) or []:
+            if field:
+                available_fields.add(field)
+
+    candidate_formulas: List[Dict[str, Any]] = []
+
+    # 奖金公式候选1：含调整系数
+    required_fields_full = {"奖金计算基数", "调整系数", "提点率", "产品线提点系数"}
+    if required_fields_full.issubset(available_fields):
+        candidate_formulas.append({
+            "output_field": "应发奖金",
+            "expression": "奖金计算基数 * 调整系数 * 提点率 * 产品线提点系数"
+        })
+        return candidate_formulas
+
+    # 奖金公式候选2：不含调整系数
+    required_fields_simple = {"奖金计算基数", "提点率", "产品线提点系数"}
+    if required_fields_simple.issubset(available_fields):
+        candidate_formulas.append({
+            "output_field": "应发奖金",
+            "expression": "奖金计算基数 * 提点率 * 产品线提点系数"
+        })
+
+    return candidate_formulas
 
 
 def validate_model_request(
@@ -1464,7 +1505,7 @@ def aggregate_df(df: pd.DataFrame, group_by: List[str], metrics: List[str]) -> p
 
 def build_breakdown_from_row(row: Dict[str, Any], preferred_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     if preferred_fields is None:
-        preferred_fields = ["奖金计算基数", "调整系数", "提点率a", "提点率b", "应发奖金"]
+        preferred_fields = ["奖金计算基数", "调整系数", "提点率", "产品线提点系数", "应发奖金"]
 
     breakdown = []
     for field in preferred_fields:
@@ -1776,6 +1817,24 @@ async def parse_workbook(
         if infer_rules_flag:
             candidate_rules = infer_candidate_rules(sheet_profiles)
 
+        # 尝试基于主事实表候选自动推断公式（仅作为候选展示）
+        candidate_formulas: List[Dict[str, Any]] = []
+        fact_sheets = [s for s in sheet_profiles if s["candidate_role"] == "fact"]
+        if fact_sheets:
+            main_fact_sheet = fact_sheets[0]["sheet_name"]
+            parsed_like = {
+                "workbook": {
+                    "sheet_names": wb.sheetnames
+                },
+                "sheets": cleanup_internal_fields(sheet_profiles)
+            }
+            candidate_formulas = infer_candidate_formulas(
+                main_fact_sheet=main_fact_sheet,
+                relationships=candidate_relationships,
+                rules=candidate_rules,
+                parsed_workbook=parsed_like
+            )
+
         if instruction:
             warnings.append(f"已接收业务说明 instruction: {instruction[:80]}")
 
@@ -1790,6 +1849,7 @@ async def parse_workbook(
             "sheets": cleanup_internal_fields(sheet_profiles),
             "candidate_relationships": candidate_relationships,
             "candidate_rules": candidate_rules,
+            "candidate_formulas": candidate_formulas,
             "instruction_extract": instruction_extract,
             "warnings": warnings
         }
@@ -1815,12 +1875,24 @@ async def build_model(payload: Dict[str, Any]):
     if not parsed_workbook:
         raise HTTPException(status_code=404, detail=f"未找到 file_id 对应的解析结果: {file_id}")
 
-    validation = validate_model_request(payload, parsed_workbook)
-
     main_fact_sheet = payload.get("main_fact_sheet")
     relationships = payload.get("relationships", [])
     rules = payload.get("rules", [])
     formulas = payload.get("formulas", [])
+
+    # 如果调用方没传公式，则自动推断候选公式
+    if not formulas and main_fact_sheet:
+        formulas = infer_candidate_formulas(
+            main_fact_sheet=main_fact_sheet,
+            relationships=relationships,
+            rules=rules,
+            parsed_workbook=parsed_workbook
+        )
+
+    payload_for_validation = deepcopy(payload)
+    payload_for_validation["formulas"] = formulas
+
+    validation = validate_model_request(payload_for_validation, parsed_workbook)
 
     plan_id = gen_plan_id()
     model_id = gen_model_id()
@@ -1845,10 +1917,13 @@ async def build_model(payload: Dict[str, Any]):
 
     response = to_jsonable(response)
 
+    stored_request = deepcopy(payload)
+    stored_request["formulas"] = formulas
+
     MODEL_STORE[model_id] = {
         "model_id": model_id,
         "file_id": file_id,
-        "request": deepcopy(payload),
+        "request": stored_request,
         "response": deepcopy(response)
     }
 

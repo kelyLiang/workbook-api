@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Workbook Parse API", version="1.3.0")
+app = FastAPI(title="Workbook Parse API", version="1.4.0")
 
 # =========================
 # 内存存储（单机版）
@@ -127,6 +127,10 @@ def ensure_object_column(df: pd.DataFrame, col: str) -> None:
     else:
         if df[col].dtype != "object":
             df[col] = df[col].astype("object")
+
+
+def valid_compare_operator(op: str) -> bool:
+    return op in {">", ">=", "<", "<="}
 
 
 # =========================
@@ -484,6 +488,8 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
                 "threshold_min_field": min_field,
                 "threshold_max_field": max_field,
                 "threshold_base_field": threshold_base_field,
+                "lower_operator": ">=",
+                "upper_operator": "<",
                 "output_field": output_field,
                 "extra_output_fields": [x for x in [ladder_flag_field, min_field, max_field] if x],
                 "confidence": 0.93 if ladder_flag_field else 0.88
@@ -637,7 +643,6 @@ def infer_candidate_formulas(
 
     candidate_formulas: List[Dict[str, Any]] = []
 
-    # 奖金公式候选1：含调整系数
     required_fields_full = {"奖金计算基数", "调整系数", "提点率", "产品线提点系数"}
     if required_fields_full.issubset(available_fields):
         candidate_formulas.append({
@@ -646,7 +651,6 @@ def infer_candidate_formulas(
         })
         return candidate_formulas
 
-    # 奖金公式候选2：不含调整系数
     required_fields_simple = {"奖金计算基数", "提点率", "产品线提点系数"}
     if required_fields_simple.issubset(available_fields):
         candidate_formulas.append({
@@ -696,6 +700,9 @@ def validate_model_request(
         )
         if not fact_role_ok:
             warnings.append(f"main_fact_sheet={main_fact_sheet} 未在 sheet_roles 中标记为 fact")
+
+    # 主表当前可得字段：主表原字段 + relationships 输出字段
+    available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
 
     for i, rel in enumerate(relationships, start=1):
         from_sheet = rel.get("from_sheet")
@@ -750,13 +757,11 @@ def validate_model_request(
                 f"relationships[{i}].output_fields"
             )
 
-    available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
-
-    for rel in relationships:
-        for field in rel.get("output_fields", []):
+        for field in output_fields:
             if field:
                 available_fields.add(field)
 
+    # rules 校验
     for i, rule in enumerate(rules, start=1):
         source_sheet = rule.get("source_sheet")
         rule_type = rule.get("rule_type")
@@ -769,6 +774,8 @@ def validate_model_request(
         threshold_base_field = rule.get("threshold_base_field")
         ladder_flag_field = rule.get("ladder_flag_field")
         extra_output_fields = rule.get("extra_output_fields", [])
+        lower_operator = rule.get("lower_operator", ">=")
+        upper_operator = rule.get("upper_operator", "<")
 
         if not rule.get("rule_name"):
             errors.append(f"rules[{i}] 缺少 rule_name")
@@ -784,15 +791,14 @@ def validate_model_request(
         if not match_keys:
             warnings.append(f"rules[{i}] 未提供 match_keys")
 
-        if source_sheet in known_sheets:
-            validate_fields_exist(
-                source_sheet,
-                [x for x in match_keys if x],
-                field_index,
-                errors,
-                f"rules[{i}].match_keys"
-            )
+        if rule_type in {"ladder_lookup", "productline_rate_lookup"}:
+            if not valid_compare_operator(lower_operator):
+                errors.append(f"rules[{i}] lower_operator 非法: {lower_operator}")
+            if not valid_compare_operator(upper_operator):
+                errors.append(f"rules[{i}] upper_operator 非法: {upper_operator}")
 
+        if source_sheet in known_sheets:
+            # 1) source_sheet 内字段校验
             if output_field:
                 validate_fields_exist(
                     source_sheet,
@@ -812,14 +818,14 @@ def validate_model_request(
                     f"rules[{i}].effective_or_flag_fields"
                 )
 
-            ladder_fields = [x for x in [threshold_min_field, threshold_max_field, threshold_base_field] if x]
-            if ladder_fields:
+            rule_threshold_fields = [x for x in [threshold_min_field, threshold_max_field] if x]
+            if rule_threshold_fields:
                 validate_fields_exist(
                     source_sheet,
-                    ladder_fields,
+                    rule_threshold_fields,
                     field_index,
                     errors,
-                    f"rules[{i}].threshold_fields"
+                    f"rules[{i}].threshold_rule_fields"
                 )
 
             if extra_output_fields:
@@ -831,6 +837,40 @@ def validate_model_request(
                     f"rules[{i}].extra_output_fields"
                 )
 
+            # 2) match_keys 校验
+            # 对 effective_lookup，通常 match_keys 来自 source_sheet 和主表同名字段
+            # 对 productline_rate_lookup / ladder_lookup，match_keys 更可能是主表当前可得字段
+            if rule_type in {"productline_rate_lookup", "ladder_lookup"}:
+                for key in match_keys:
+                    if not key:
+                        continue
+                    if key not in available_fields:
+                        errors.append(f"rules[{i}].match_keys 字段不存在于主表可得字段中: field={key}")
+            else:
+                validate_fields_exist(
+                    source_sheet,
+                    [x for x in match_keys if x],
+                    field_index,
+                    errors,
+                    f"rules[{i}].match_keys"
+                )
+                for key in match_keys:
+                    if key and key not in available_fields:
+                        warnings.append(f"rules[{i}].match_keys 字段当前不在主表可得字段中: field={key}")
+
+        # 3) threshold_base_field 应校验主表，不校验 source_sheet
+        if threshold_base_field:
+            if main_fact_sheet in known_sheets:
+                validate_fields_exist(
+                    main_fact_sheet,
+                    [threshold_base_field],
+                    field_index,
+                    errors,
+                    f"rules[{i}].threshold_base_field"
+                )
+            else:
+                warnings.append(f"rules[{i}] 无法校验 threshold_base_field，因为 main_fact_sheet 不存在")
+
         if rule_type == "effective_lookup":
             if not effective_start_field or not effective_end_field:
                 errors.append(f"rules[{i}] rule_type=effective_lookup 时必须提供 effective_start_field 和 effective_end_field")
@@ -839,12 +879,14 @@ def validate_model_request(
             if not output_field:
                 errors.append(f"rules[{i}] {rule_type} 时必须提供 output_field")
 
+        # 更新主表可得字段，供后续 formula 校验
         if output_field:
             available_fields.add(output_field)
         for f in extra_output_fields:
             if f:
                 available_fields.add(f)
 
+    # formulas 校验
     for i, formula in enumerate(formulas, start=1):
         output_field = formula.get("output_field")
         expression = formula.get("expression")
@@ -879,6 +921,7 @@ def validate_model_request(
         "errors": errors,
         "warnings": warnings
     }
+
 
 
 # =========================
@@ -1031,34 +1074,50 @@ def safe_formula_eval(df: pd.DataFrame, expression: str) -> pd.Series:
     return eval(expr, allowed_globals, {})
 
 
+def compare_value(base_value: float, bound_value: float, operator: str) -> bool:
+    if operator == ">":
+        return base_value > bound_value
+    if operator == ">=":
+        return base_value >= bound_value
+    if operator == "<":
+        return base_value < bound_value
+    if operator == "<=":
+        return base_value <= bound_value
+    raise ValueError(f"不支持的比较运算符: {operator}")
+
+
 def filter_by_ladder_bounds(
         df: pd.DataFrame,
         base_value: Any,
         threshold_min_field: Optional[str],
         threshold_max_field: Optional[str],
+        lower_operator: str = ">=",
+        upper_operator: str = "<",
 ) -> pd.DataFrame:
     numeric_base = pd.to_numeric(pd.Series([base_value]), errors="coerce").iloc[0]
     if pd.isna(numeric_base):
         return df.iloc[0:0].copy()
 
-    min_series = (
-        pd.to_numeric(df[threshold_min_field], errors="coerce")
-        if threshold_min_field and threshold_min_field in df.columns
-        else pd.Series([np.nan] * len(df), index=df.index)
-    )
-    max_series = (
-        pd.to_numeric(df[threshold_max_field], errors="coerce")
-        if threshold_max_field and threshold_max_field in df.columns
-        else pd.Series([np.nan] * len(df), index=df.index)
-    )
+    matched_index = []
 
-    # 业务规则：
-    # 1. 有阶梯上限：base > 上限 才命中
-    # 2. 有阶梯下限：base <= 下限 才命中
-    cond_upper = max_series.isna() | (numeric_base > max_series)
-    cond_lower = min_series.isna() | (numeric_base <= min_series)
+    for idx in df.index:
+        lower_ok = True
+        upper_ok = True
 
-    return df[cond_upper & cond_lower]
+        if threshold_min_field and threshold_min_field in df.columns:
+            lower_value = pd.to_numeric(pd.Series([df.at[idx, threshold_min_field]]), errors="coerce").iloc[0]
+            if pd.notna(lower_value):
+                lower_ok = compare_value(numeric_base, lower_value, lower_operator)
+
+        if threshold_max_field and threshold_max_field in df.columns:
+            upper_value = pd.to_numeric(pd.Series([df.at[idx, threshold_max_field]]), errors="coerce").iloc[0]
+            if pd.notna(upper_value):
+                upper_ok = compare_value(numeric_base, upper_value, upper_operator)
+
+        if lower_ok and upper_ok:
+            matched_index.append(idx)
+
+    return df.loc[matched_index].copy()
 
 
 def execute_lookup(
@@ -1198,6 +1257,8 @@ def execute_ladder_lookup(
     threshold_min_field = rule.get("threshold_min_field")
     threshold_max_field = rule.get("threshold_max_field")
     threshold_base_field = rule.get("threshold_base_field")
+    lower_operator = rule.get("lower_operator", ">=")
+    upper_operator = rule.get("upper_operator", "<")
     output_field = rule.get("output_field")
 
     if not output_field:
@@ -1205,6 +1266,11 @@ def execute_ladder_lookup(
 
     if not threshold_min_field and not threshold_max_field:
         raise ValueError("ladder_lookup 至少需要 threshold_min_field 或 threshold_max_field")
+
+    if not valid_compare_operator(lower_operator):
+        raise ValueError(f"ladder_lookup 非法 lower_operator: {lower_operator}")
+    if not valid_compare_operator(upper_operator):
+        raise ValueError(f"ladder_lookup 非法 upper_operator: {upper_operator}")
 
     ensure_object_column(fact_df, output_field)
 
@@ -1242,6 +1308,8 @@ def execute_ladder_lookup(
             fact_df.at[idx, threshold_base_field],
             threshold_min_field,
             threshold_max_field,
+            lower_operator=lower_operator,
+            upper_operator=upper_operator,
         )
 
         if len(matched) > 0 and output_field in matched.columns:
@@ -1252,10 +1320,10 @@ def execute_ladder_lookup(
         logic_parts.append(" + ".join(match_keys))
     if start_field and end_field:
         logic_parts.append("生效失效区间")
-    if threshold_max_field:
-        logic_parts.append(f"{threshold_base_field} > {threshold_max_field}")
     if threshold_min_field:
-        logic_parts.append(f"{threshold_base_field} <= {threshold_min_field}")
+        logic_parts.append(f"{threshold_base_field} {lower_operator} {threshold_min_field}")
+    if threshold_max_field:
+        logic_parts.append(f"{threshold_base_field} {upper_operator} {threshold_max_field}")
 
     lineage.append({
         "field": output_field,
@@ -1286,11 +1354,18 @@ def execute_productline_rate_lookup(
     threshold_min_field = rule.get("threshold_min_field")
     threshold_max_field = rule.get("threshold_max_field")
     threshold_base_field = rule.get("threshold_base_field")
+    lower_operator = rule.get("lower_operator", ">=")
+    upper_operator = rule.get("upper_operator", "<")
     output_field = rule.get("output_field")
     extra_output_fields = rule.get("extra_output_fields", []) or []
 
     if not output_field:
         raise ValueError("productline_rate_lookup 缺少 output_field")
+
+    if not valid_compare_operator(lower_operator):
+        raise ValueError(f"productline_rate_lookup 非法 lower_operator: {lower_operator}")
+    if not valid_compare_operator(upper_operator):
+        raise ValueError(f"productline_rate_lookup 非法 upper_operator: {upper_operator}")
 
     for col in [output_field] + extra_output_fields:
         if col:
@@ -1309,7 +1384,6 @@ def execute_productline_rate_lookup(
     for idx in fact_df.index:
         matched = rule_df.copy()
 
-        # 1. 先按产品线名称等维度匹配
         for key in match_keys:
             if key not in fact_df.columns or key not in matched.columns:
                 continue
@@ -1318,7 +1392,6 @@ def execute_productline_rate_lookup(
                 safe_str(fact_df.at[idx, key])
                 ]
 
-        # 2. 再按生效失效区间过滤
         current_date = fact_dates.loc[idx]
         if pd.notna(current_date) and start_field and end_field:
             matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
@@ -1328,7 +1401,6 @@ def execute_productline_rate_lookup(
 
         selected = None
 
-        # 3. 判断是否阶梯提点
         if ladder_flag_field and ladder_flag_field in matched.columns:
             ladder_rows = matched[matched[ladder_flag_field].apply(truthy_flag)]
             non_ladder_rows = matched[~matched[ladder_flag_field].apply(truthy_flag)]
@@ -1336,22 +1408,21 @@ def execute_productline_rate_lookup(
             ladder_rows = matched
             non_ladder_rows = pd.DataFrame(columns=matched.columns)
 
-        # 4. 若为阶梯提点，则按新的上限/下限规则命中
         if not ladder_rows.empty and threshold_base_field and threshold_base_field in fact_df.columns:
             ladder_hit = filter_by_ladder_bounds(
                 ladder_rows,
                 fact_df.at[idx, threshold_base_field],
                 threshold_min_field,
                 threshold_max_field,
+                lower_operator=lower_operator,
+                upper_operator=upper_operator,
             )
             if not ladder_hit.empty:
                 selected = ladder_hit.iloc[0]
 
-        # 5. 若不是阶梯或阶梯没命中，则取非阶梯记录
         if selected is None and not non_ladder_rows.empty:
             selected = non_ladder_rows.iloc[0]
 
-        # 6. 最后兜底
         if selected is None and not matched.empty:
             selected = matched.iloc[0]
 
@@ -1372,10 +1443,10 @@ def execute_productline_rate_lookup(
         logic_parts.append("按生效失效区间过滤")
     if ladder_flag_field:
         logic_parts.append(f"依据{ladder_flag_field}判断是否阶梯提点")
-    if threshold_max_field and threshold_base_field:
-        logic_parts.append(f"若有{threshold_max_field}则要求{threshold_base_field}>{threshold_max_field}")
     if threshold_min_field and threshold_base_field:
-        logic_parts.append(f"若有{threshold_min_field}则要求{threshold_base_field}<={threshold_min_field}")
+        logic_parts.append(f"{threshold_base_field} {lower_operator} {threshold_min_field}")
+    if threshold_max_field and threshold_base_field:
+        logic_parts.append(f"{threshold_base_field} {upper_operator} {threshold_max_field}")
     logic_parts.append(f"输出{output_field}")
 
     lineage.append({
@@ -1817,7 +1888,6 @@ async def parse_workbook(
         if infer_rules_flag:
             candidate_rules = infer_candidate_rules(sheet_profiles)
 
-        # 尝试基于主事实表候选自动推断公式（仅作为候选展示）
         candidate_formulas: List[Dict[str, Any]] = []
         fact_sheets = [s for s in sheet_profiles if s["candidate_role"] == "fact"]
         if fact_sheets:
@@ -1880,7 +1950,6 @@ async def build_model(payload: Dict[str, Any]):
     rules = payload.get("rules", [])
     formulas = payload.get("formulas", [])
 
-    # 如果调用方没传公式，则自动推断候选公式
     if not formulas and main_fact_sheet:
         formulas = infer_candidate_formulas(
             main_fact_sheet=main_fact_sheet,

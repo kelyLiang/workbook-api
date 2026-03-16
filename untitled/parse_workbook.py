@@ -701,7 +701,6 @@ def validate_model_request(
         if not fact_role_ok:
             warnings.append(f"main_fact_sheet={main_fact_sheet} 未在 sheet_roles 中标记为 fact")
 
-    # 主表当前可得字段：主表原字段 + relationships 输出字段
     available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
 
     for i, rel in enumerate(relationships, start=1):
@@ -761,7 +760,6 @@ def validate_model_request(
             if field:
                 available_fields.add(field)
 
-    # rules 校验
     for i, rule in enumerate(rules, start=1):
         source_sheet = rule.get("source_sheet")
         rule_type = rule.get("rule_type")
@@ -798,7 +796,6 @@ def validate_model_request(
                 errors.append(f"rules[{i}] upper_operator 非法: {upper_operator}")
 
         if source_sheet in known_sheets:
-            # 1) source_sheet 内字段校验
             if output_field:
                 validate_fields_exist(
                     source_sheet,
@@ -837,9 +834,6 @@ def validate_model_request(
                     f"rules[{i}].extra_output_fields"
                 )
 
-            # 2) match_keys 校验
-            # 对 effective_lookup，通常 match_keys 来自 source_sheet 和主表同名字段
-            # 对 productline_rate_lookup / ladder_lookup，match_keys 更可能是主表当前可得字段
             if rule_type in {"productline_rate_lookup", "ladder_lookup"}:
                 for key in match_keys:
                     if not key:
@@ -858,7 +852,6 @@ def validate_model_request(
                     if key and key not in available_fields:
                         warnings.append(f"rules[{i}].match_keys 字段当前不在主表可得字段中: field={key}")
 
-        # 3) threshold_base_field 应校验主表，不校验 source_sheet
         if threshold_base_field:
             if main_fact_sheet in known_sheets:
                 validate_fields_exist(
@@ -879,14 +872,12 @@ def validate_model_request(
             if not output_field:
                 errors.append(f"rules[{i}] {rule_type} 时必须提供 output_field")
 
-        # 更新主表可得字段，供后续 formula 校验
         if output_field:
             available_fields.add(output_field)
         for f in extra_output_fields:
             if f:
                 available_fields.add(f)
 
-    # formulas 校验
     for i, formula in enumerate(formulas, start=1):
         output_field = formula.get("output_field")
         expression = formula.get("expression")
@@ -921,7 +912,6 @@ def validate_model_request(
         "errors": errors,
         "warnings": warnings
     }
-
 
 
 # =========================
@@ -1509,6 +1499,18 @@ def compute_stats(df: pd.DataFrame) -> Dict[str, Any]:
 # =========================
 # 查询工具
 # =========================
+def normalize_filters_payload(filters: Any) -> Dict[str, Any]:
+    """
+    Dify 已经把 filters 转成 filters_obj 后传入，这里做兜底标准化。
+    支持：
+    1. dict -> 直接返回
+    2. 其他 -> 返回 {}
+    """
+    if isinstance(filters, dict):
+        return filters
+    return {}
+
+
 def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     if not filters:
         return df
@@ -1620,24 +1622,38 @@ def query_metric(
     need_rows = bool(payload.get("need_rows", True))
     need_breakdown = bool(payload.get("need_breakdown", True))
     need_lineage = bool(payload.get("need_lineage", False))
-    filters = payload.get("filters", {}) or {}
+
+    filters = normalize_filters_payload(payload.get("filters", {}))
+    group_by = payload.get("group_by", []) or []
+    result_grain = payload.get("result_grain", []) or []
 
     filtered = apply_filters(df, filters)
 
+    effective_group_by = group_by if group_by else result_grain
+    effective_group_by = select_existing_columns(filtered, effective_group_by)
+
+    if effective_group_by:
+        result_df = aggregate_df(filtered, effective_group_by, metrics)
+    else:
+        result_df = filtered.copy()
+
     summary: Dict[str, Any] = {}
     for m in metrics:
-        if m in filtered.columns:
-            summary[m] = float(pd.to_numeric(filtered[m], errors="coerce").sum())
+        if m in result_df.columns:
+            summary[m] = float(pd.to_numeric(result_df[m], errors="coerce").sum())
 
     rows: List[Dict[str, Any]] = []
-    if need_rows:
-        keep_cols = []
-        if not filtered.empty:
+    if need_rows and not result_df.empty:
+        keep_cols = effective_group_by + metrics
+        keep_cols = [c for c in keep_cols if c in result_df.columns]
+
+        if not keep_cols:
             base_cols = ["统计年月", "销售", "客户名称"] + metrics
-            keep_cols = [c for c in base_cols if c in filtered.columns]
-            if not keep_cols:
-                keep_cols = list(filtered.columns[:10])
-        rows = normalize_records(filtered[keep_cols].head(100).to_dict(orient="records")) if keep_cols else []
+            keep_cols = [c for c in base_cols if c in result_df.columns]
+
+        rows = normalize_records(
+            result_df[keep_cols].head(100).to_dict(orient="records")
+        ) if keep_cols else []
 
     breakdown: List[Dict[str, Any]] = []
     if need_breakdown and not filtered.empty:
@@ -1650,7 +1666,8 @@ def query_metric(
         "summary": to_jsonable(summary),
         "rows": rows,
         "breakdown": breakdown,
-        "warnings": []
+        "warnings": [],
+        "effective_group_by": effective_group_by
     }
 
     if need_lineage:
@@ -1663,7 +1680,7 @@ def query_metric(
 def query_ranking(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
     group_by = payload.get("group_by", []) or []
-    filters = payload.get("filters", {}) or {}
+    filters = normalize_filters_payload(payload.get("filters", {}))
     sort_by = payload.get("sort_by", []) or []
     top_n = payload.get("top_n")
     need_rows = bool(payload.get("need_rows", True))
@@ -1706,7 +1723,7 @@ def query_ranking(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_trend(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = payload.get("filters", {}) or {}
+    filters = normalize_filters_payload(payload.get("filters", {}))
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)
@@ -1745,7 +1762,7 @@ def query_trend(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_compare(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = payload.get("filters", {}) or {}
+    filters = normalize_filters_payload(payload.get("filters", {}))
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)
@@ -1766,7 +1783,7 @@ def query_compare(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_breakdown(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = payload.get("filters", {}) or {}
+    filters = normalize_filters_payload(payload.get("filters", {}))
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)

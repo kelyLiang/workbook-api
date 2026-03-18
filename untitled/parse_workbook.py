@@ -13,8 +13,9 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+print("### LOADED PARSE_WORKBOOK VERSION 1.6.0-RICHARD-TEST ###")
 
-app = FastAPI(title="Workbook Parse API", version="1.4.0")
+app = FastAPI(title="Workbook Parse API", version="1.6.0")
 
 # =========================
 # 内存存储（单机版）
@@ -83,7 +84,7 @@ def normalize_cell_value(v: Any) -> Any:
             return None
         return float(v)
 
-    if isinstance(v, (np.bool_,)):
+    if isinstance(v, (np.bool_, bool)):
         return bool(v)
 
     try:
@@ -116,9 +117,52 @@ def is_empty_row(row: List[Any]) -> bool:
     return all(cell is None or safe_str(cell) == "" for cell in row)
 
 
+def parse_ladder_flag(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if float(v) == 1:
+            return True
+        if float(v) == 0:
+            return False
+
+    s = safe_str(v).strip().lower()
+    if not s:
+        return None
+
+    true_values = {
+        "1", "y", "yes", "true", "t",
+        "是", "阶梯", "阶梯提点", "需要阶梯", "按阶梯", "梯度"
+    }
+    false_values = {
+        "0", "n", "no", "false", "f",
+        "否", "非阶梯", "普通", "不阶梯", "否（不阶梯）", "否(不阶梯)"
+    }
+
+    if s in true_values:
+        return True
+    if s in false_values:
+        return False
+
+    if "阶梯" in s and "否" not in s and "不" not in s and "非" not in s:
+        return True
+    if "非阶梯" in s or "不阶梯" in s:
+        return False
+
+    return None
+
+
 def truthy_flag(v: Any) -> bool:
-    s = safe_str(v).lower()
-    return s in {"1", "y", "yes", "true", "是", "阶梯", "阶梯提点"}
+    return parse_ladder_flag(v) is True
 
 
 def ensure_object_column(df: pd.DataFrame, col: str) -> None:
@@ -131,6 +175,109 @@ def ensure_object_column(df: pd.DataFrame, col: str) -> None:
 
 def valid_compare_operator(op: str) -> bool:
     return op in {">", ">=", "<", "<="}
+
+FIELD_ALIAS_MAP: Dict[str, List[str]] = {
+    "提点产品线名称": ["提成产品线名称"],
+    "提成产品线名称": ["提点产品线名称"],
+}
+
+
+def get_field_alias_candidates(field_name: Any) -> List[str]:
+    s = safe_str(field_name)
+    if not s:
+        return []
+    candidates = [s]
+    for alias in FIELD_ALIAS_MAP.get(s, []):
+        if alias not in candidates:
+            candidates.append(alias)
+    return candidates
+
+
+def find_existing_field(field_name: Any, existing_fields: Any) -> Optional[str]:
+    existing = set(existing_fields)
+    for candidate in get_field_alias_candidates(field_name):
+        if candidate in existing:
+            return candidate
+    return None
+
+
+def key_item_to_text(key_item: Any) -> str:
+    if isinstance(key_item, dict):
+        fact_field = safe_str(
+            key_item.get("fact_field")
+            or key_item.get("from_field")
+            or key_item.get("left_field")
+            or key_item.get("field")
+            or key_item.get("name")
+        )
+        rule_field = safe_str(
+            key_item.get("rule_field")
+            or key_item.get("to_field")
+            or key_item.get("right_field")
+        )
+        if fact_field and rule_field and fact_field != rule_field:
+            return f"{fact_field}->{rule_field}"
+        return fact_field or rule_field or str(key_item)
+    return safe_str(key_item)
+
+
+def resolve_match_key_pair(
+        match_key: Any,
+        fact_fields: Any,
+        rule_fields: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    fact_field_name = ""
+    rule_field_name = ""
+
+    if isinstance(match_key, dict):
+        fact_field_name = safe_str(
+            match_key.get("fact_field")
+            or match_key.get("from_field")
+            or match_key.get("left_field")
+            or match_key.get("field")
+            or match_key.get("name")
+        )
+        rule_field_name = safe_str(
+            match_key.get("rule_field")
+            or match_key.get("to_field")
+            or match_key.get("right_field")
+        )
+
+        if not fact_field_name and rule_field_name:
+            fact_field_name = rule_field_name
+        if not rule_field_name and fact_field_name:
+            rule_field_name = fact_field_name
+    else:
+        fact_field_name = safe_str(match_key)
+        rule_field_name = fact_field_name
+
+    fact_field = find_existing_field(fact_field_name, fact_fields) if fact_field_name else None
+    rule_field = find_existing_field(rule_field_name, rule_fields) if rule_field_name else None
+
+    if fact_field is None and rule_field_name:
+        fact_field = find_existing_field(rule_field_name, fact_fields)
+    if rule_field is None and fact_field_name:
+        rule_field = find_existing_field(fact_field_name, rule_fields)
+
+    return fact_field, rule_field
+
+
+def build_match_key_pairs(
+        match_keys: List[Any],
+        fact_fields: Any,
+        rule_fields: Any,
+) -> Tuple[List[Tuple[str, str]], List[Any]]:
+    pairs: List[Tuple[str, str]] = []
+    unresolved: List[Any] = []
+
+    for item in match_keys or []:
+        fact_field, rule_field = resolve_match_key_pair(item, fact_fields, rule_fields)
+        if fact_field and rule_field:
+            pairs.append((fact_field, rule_field))
+        else:
+            unresolved.append(item)
+
+    return pairs, unresolved
 
 
 # =========================
@@ -276,7 +423,7 @@ def infer_grain_candidates(header: List[str]) -> List[List[str]]:
     candidates = []
 
     preferred = []
-    for key in ["统计年月", "年月", "工号", "uid", "收入类型", "产品线名称", "产品类型名称", "提点产品线名称"]:
+    for key in ["统计年月", "年月", "工号", "uid", "收入类型", "产品线名称", "产品类型名称", "提点产品线名称", "客户名称"]:
         nk = normalize_name(key)
         if nk in header_norm_map:
             preferred.append(header_norm_map[nk])
@@ -291,7 +438,7 @@ def infer_grain_candidates(header: List[str]) -> List[List[str]]:
             if any(k in nh for k in ["工号", "uid", "id", "类型", "名称", "年月", "日期"]):
                 dims.append(h)
         if dims:
-            candidates.append(dims[:4])
+            candidates.append(dims[:5])
 
     return candidates
 
@@ -407,14 +554,6 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
     rules = []
     rule_idx = 1
 
-    def pick(header: List[str], *cands: str) -> Optional[str]:
-        norm_map = {normalize_name(h): h for h in header if safe_str(h)}
-        for c in cands:
-            nc = normalize_name(c)
-            if nc in norm_map:
-                return norm_map[nc]
-        return None
-
     for s in sheet_profiles:
         sheet_name = s["sheet_name"]
         header = [h for h in s["_header"] if safe_str(h)]
@@ -468,14 +607,7 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
         has_output = output_field is not None
 
         if has_output and (has_threshold or ladder_flag_field is not None):
-            threshold_base_field = None
-            for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
-                picked = pick(header, c)
-                if picked:
-                    threshold_base_field = picked
-                    break
-
-            rules.append({
+            rule_obj = {
                 "rule_id": f"rule_{rule_idx:03d}",
                 "rule_name": f"{normalize_name(sheet_name)}_productline_rate",
                 "source_sheet": sheet_name,
@@ -487,13 +619,21 @@ def infer_candidate_rules(sheet_profiles: List[Dict[str, Any]]) -> List[Dict[str
                 "ladder_flag_field": ladder_flag_field,
                 "threshold_min_field": min_field,
                 "threshold_max_field": max_field,
-                "threshold_base_field": threshold_base_field,
+                "threshold_base_field": None,
                 "lower_operator": ">=",
                 "upper_operator": "<",
                 "output_field": output_field,
                 "extra_output_fields": [x for x in [ladder_flag_field, min_field, max_field] if x],
                 "confidence": 0.93 if ladder_flag_field else 0.88
-            })
+            }
+
+            # 对提点率b默认启用“按客户+提点产品线汇总后再命中阶梯”，默认不按月分组
+            # if "提点率b" in sheet_name or ("提点系数" in safe_str(output_field) and ladder_flag_field):
+            #     rule_obj["group_scope_fields"] = ["提点产品线名称", "客户名称"]
+            #     rule_obj["group_scope_include_date"] = False
+            #     rule_obj["threshold_agg"] = "sum"
+
+            rules.append(rule_obj)
             rule_idx += 1
             continue
 
@@ -703,6 +843,7 @@ def validate_model_request(
 
     available_fields = set(field_index.get(main_fact_sheet, set())) if main_fact_sheet else set()
 
+    # 先校验 relationships，并把 relationship 输出字段加入主表可得字段
     for i, rel in enumerate(relationships, start=1):
         from_sheet = rel.get("from_sheet")
         to_sheet = rel.get("to_sheet")
@@ -760,6 +901,7 @@ def validate_model_request(
             if field:
                 available_fields.add(field)
 
+    # 再校验 rules
     for i, rule in enumerate(rules, start=1):
         source_sheet = rule.get("source_sheet")
         rule_type = rule.get("rule_type")
@@ -780,8 +922,10 @@ def validate_model_request(
 
         if not source_sheet:
             errors.append(f"rules[{i}] 缺少 source_sheet")
+            source_fields: Set[str] = set()
         else:
             validate_sheet_exists(source_sheet, known_sheets, errors, f"rules[{i}].source_sheet")
+            source_fields = set(field_index.get(source_sheet, set()))
 
         if not rule_type:
             errors.append(f"rules[{i}] 缺少 rule_type")
@@ -795,6 +939,7 @@ def validate_model_request(
             if not valid_compare_operator(upper_operator):
                 errors.append(f"rules[{i}] upper_operator 非法: {upper_operator}")
 
+        # source_sheet 内字段校验
         if source_sheet in known_sheets:
             if output_field:
                 validate_fields_exist(
@@ -834,24 +979,26 @@ def validate_model_request(
                     f"rules[{i}].extra_output_fields"
                 )
 
-            if rule_type in {"productline_rate_lookup", "ladder_lookup"}:
-                for key in match_keys:
-                    if not key:
-                        continue
-                    if key not in available_fields:
-                        errors.append(f"rules[{i}].match_keys 字段不存在于主表可得字段中: field={key}")
-            else:
-                validate_fields_exist(
-                    source_sheet,
-                    [x for x in match_keys if x],
-                    field_index,
-                    errors,
-                    f"rules[{i}].match_keys"
-                )
-                for key in match_keys:
-                    if key and key not in available_fields:
-                        warnings.append(f"rules[{i}].match_keys 字段当前不在主表可得字段中: field={key}")
+        # match_keys 做 alias-aware 校验
+        resolved_pairs, unresolved_keys = build_match_key_pairs(
+            match_keys=match_keys,
+            fact_fields=available_fields,
+            rule_fields=source_fields,
+        )
+        normalized_match_keys = [fact_field for fact_field, _ in resolved_pairs]
 
+        for unresolved in unresolved_keys:
+            errors.append(
+                f"rules[{i}].match_keys 无法同时匹配主表字段与规则表字段: {key_item_to_text(unresolved)}"
+            )
+
+        if rule_type == "productline_rate_lookup" and normalized_match_keys == ["提点产品线名称"]:
+            warnings.append(
+                f"rules[{i}] productline_rate_lookup 当前按单一业务键 提点产品线名称 匹配。"
+                f"执行阶段将采用：先尝试阶梯区间命中，若未命中再回退固定系数。"
+            )
+
+        # threshold_base_field 校验：必须来自主表
         if threshold_base_field:
             if main_fact_sheet in known_sheets:
                 validate_fields_exist(
@@ -866,7 +1013,9 @@ def validate_model_request(
 
         if rule_type == "effective_lookup":
             if not effective_start_field or not effective_end_field:
-                errors.append(f"rules[{i}] rule_type=effective_lookup 时必须提供 effective_start_field 和 effective_end_field")
+                errors.append(
+                    f"rules[{i}] rule_type=effective_lookup 时必须提供 effective_start_field 和 effective_end_field"
+                )
 
         if rule_type in {"ladder_lookup", "productline_rate_lookup"}:
             if not output_field:
@@ -878,6 +1027,7 @@ def validate_model_request(
             if f:
                 available_fields.add(f)
 
+    # formulas 校验
     for i, formula in enumerate(formulas, start=1):
         output_field = formula.get("output_field")
         expression = formula.get("expression")
@@ -1002,10 +1152,18 @@ def infer_schema_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
         if pd.api.types.is_numeric_dtype(series):
             data_type = "number"
-        elif len(non_null) > 0 and non_null.astype(str).str.match(r"^\d{4}-\d{1,2}(-\d{1,2})?$").mean() >= 0.6:
-            data_type = "date"
         else:
-            data_type = "string"
+            if len(non_null) > 0:
+                numeric_try = pd.to_numeric(non_null, errors="coerce")
+                numeric_ratio = numeric_try.notna().mean()
+                if numeric_ratio >= 0.8:
+                    data_type = "number"
+                elif non_null.astype(str).str.match(r"^\d{4}-\d{1,2}(-\d{1,2})?$").mean() >= 0.6:
+                    data_type = "date"
+                else:
+                    data_type = "string"
+            else:
+                data_type = "string"
 
         semantic_type = infer_result_semantic_type(col, data_type)
         schema.append({
@@ -1074,6 +1232,57 @@ def compare_value(base_value: float, bound_value: float, operator: str) -> bool:
     if operator == "<=":
         return base_value <= bound_value
     raise ValueError(f"不支持的比较运算符: {operator}")
+
+
+def build_group_scope_key(
+        row: pd.Series,
+        scope_fields: List[str],
+) -> Tuple[Any, ...]:
+    values = []
+    for f in scope_fields:
+        if f in row.index:
+            values.append(safe_str(row[f]))
+        else:
+            values.append("")
+    return tuple(values)
+
+
+def build_group_aggregate_map(
+        fact_df: pd.DataFrame,
+        scope_fields: List[str],
+        threshold_base_field: str,
+        agg_func: str = "sum",
+) -> Dict[Tuple[Any, ...], float]:
+    if not scope_fields or threshold_base_field not in fact_df.columns:
+        return {}
+
+    temp_df = fact_df.copy()
+    temp_df[threshold_base_field] = pd.to_numeric(temp_df[threshold_base_field], errors="coerce")
+
+    valid_scope_fields = [f for f in scope_fields if f in temp_df.columns]
+    if not valid_scope_fields:
+        return {}
+
+    grouped = temp_df.groupby(valid_scope_fields, dropna=False)[threshold_base_field]
+
+    if agg_func == "sum":
+        agg_series = grouped.sum(min_count=1)
+    elif agg_func == "max":
+        agg_series = grouped.max()
+    elif agg_func == "min":
+        agg_series = grouped.min()
+    elif agg_func == "avg":
+        agg_series = grouped.mean()
+    else:
+        agg_series = grouped.sum(min_count=1)
+
+    result: Dict[Tuple[Any, ...], float] = {}
+    for idx, value in agg_series.items():
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        result[tuple(safe_str(x) for x in idx)] = float(value) if pd.notna(value) else np.nan
+
+    return result
 
 
 def filter_by_ladder_bounds(
@@ -1195,15 +1404,24 @@ def execute_effective_lookup(
     rule_start = ensure_datetime_column(rule_df, start_field)
     rule_end = ensure_datetime_column(rule_df, end_field)
 
+    key_pairs, unresolved_keys = build_match_key_pairs(
+        match_keys=match_keys,
+        fact_fields=fact_df.columns,
+        rule_fields=rule_df.columns,
+    )
+    if unresolved_keys:
+        raise ValueError(
+            "effective_lookup 存在无法解析的 match_keys: "
+            + ", ".join(key_item_to_text(x) for x in unresolved_keys)
+        )
+
     for idx in fact_df.index:
         matched = rule_df.copy()
 
-        for key in match_keys:
-            if key not in fact_df.columns or key not in matched.columns:
-                continue
+        for fact_field, rule_field in key_pairs:
             matched = matched[
-                normalize_join_key_series(matched[key]) ==
-                safe_str(fact_df.at[idx, key])
+                normalize_join_key_series(matched[rule_field]) ==
+                safe_str(fact_df.at[idx, fact_field])
                 ]
 
         current_date = fact_dates.loc[idx]
@@ -1214,8 +1432,8 @@ def execute_effective_lookup(
             fact_df.at[idx, output_field] = matched.iloc[0][output_field]
 
     logic_parts = []
-    if match_keys:
-        logic_parts.append(" + ".join(match_keys))
+    if key_pairs:
+        logic_parts.append(" + ".join([f"{a}={b}" for a, b in key_pairs]))
     if start_field and end_field:
         logic_parts.append("生效失效区间")
 
@@ -1226,7 +1444,6 @@ def execute_effective_lookup(
     })
 
     return fact_df
-
 
 def execute_ladder_lookup(
         fact_df: pd.DataFrame,
@@ -1269,8 +1486,7 @@ def execute_ladder_lookup(
     rule_end = ensure_datetime_column(rule_df, end_field)
 
     if not threshold_base_field or threshold_base_field not in fact_df.columns:
-        candidates = ["奖金计算基数", "业绩", "金额", "收入", "base"]
-        for c in candidates:
+        for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
             if c in fact_df.columns:
                 threshold_base_field = c
                 break
@@ -1278,15 +1494,24 @@ def execute_ladder_lookup(
     if not threshold_base_field or threshold_base_field not in fact_df.columns:
         raise ValueError("ladder_lookup 无法确定 threshold_base_field，请在 rule config 中显式提供")
 
+    key_pairs, unresolved_keys = build_match_key_pairs(
+        match_keys=match_keys,
+        fact_fields=fact_df.columns,
+        rule_fields=rule_df.columns,
+    )
+    if unresolved_keys:
+        raise ValueError(
+            "ladder_lookup 存在无法解析的 match_keys: "
+            + ", ".join(key_item_to_text(x) for x in unresolved_keys)
+        )
+
     for idx in fact_df.index:
         matched = rule_df.copy()
 
-        for key in match_keys:
-            if key not in fact_df.columns or key not in matched.columns:
-                continue
+        for fact_field, rule_field in key_pairs:
             matched = matched[
-                normalize_join_key_series(matched[key]) ==
-                safe_str(fact_df.at[idx, key])
+                normalize_join_key_series(matched[rule_field]) ==
+                safe_str(fact_df.at[idx, fact_field])
                 ]
 
         current_date = fact_dates.loc[idx]
@@ -1306,8 +1531,8 @@ def execute_ladder_lookup(
             fact_df.at[idx, output_field] = matched.iloc[0][output_field]
 
     logic_parts = []
-    if match_keys:
-        logic_parts.append(" + ".join(match_keys))
+    if key_pairs:
+        logic_parts.append(" + ".join([f"{a}={b}" for a, b in key_pairs]))
     if start_field and end_field:
         logic_parts.append("生效失效区间")
     if threshold_min_field:
@@ -1357,86 +1582,183 @@ def execute_productline_rate_lookup(
     if not valid_compare_operator(upper_operator):
         raise ValueError(f"productline_rate_lookup 非法 upper_operator: {upper_operator}")
 
-    for col in [output_field] + extra_output_fields:
-        if col:
-            ensure_object_column(fact_df, col)
+    # 统一解析规则表字段，支持别名
+    rule_fields = set(rule_df.columns)
+    fact_fields = set(fact_df.columns)
 
-    fact_dates = ensure_datetime_column(fact_df, date_field)
-    rule_start = ensure_datetime_column(rule_df, start_field) if start_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
-    rule_end = ensure_datetime_column(rule_df, end_field) if end_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
+    resolved_output_field = find_existing_field(output_field, rule_fields)
+    if not resolved_output_field:
+        raise ValueError(f"productline_rate_lookup 输出字段不存在于规则表: {output_field}")
 
-    if not threshold_base_field or threshold_base_field not in fact_df.columns:
+    resolved_ladder_flag_field = find_existing_field(ladder_flag_field, rule_fields) if ladder_flag_field else None
+    resolved_threshold_min_field = find_existing_field(threshold_min_field, rule_fields) if threshold_min_field else None
+    resolved_threshold_max_field = find_existing_field(threshold_max_field, rule_fields) if threshold_max_field else None
+    resolved_start_field = find_existing_field(start_field, rule_fields) if start_field else None
+    resolved_end_field = find_existing_field(end_field, rule_fields) if end_field else None
+
+    resolved_extra_output_fields: List[str] = []
+    extra_output_pairs: List[Tuple[str, str]] = []
+    for raw_col in extra_output_fields:
+        resolved_col = find_existing_field(raw_col, rule_fields)
+        if resolved_col:
+            resolved_extra_output_fields.append(resolved_col)
+            extra_output_pairs.append((raw_col, resolved_col))
+
+    resolved_threshold_base_field = find_existing_field(threshold_base_field, fact_fields) if threshold_base_field else None
+    if not resolved_threshold_base_field:
         for c in ["奖金计算基数", "业绩", "金额", "收入", "base"]:
             if c in fact_df.columns:
-                threshold_base_field = c
+                resolved_threshold_base_field = c
                 break
+
+    if not resolved_threshold_base_field or resolved_threshold_base_field not in fact_df.columns:
+        raise ValueError("productline_rate_lookup 无法确定 threshold_base_field")
+
+    # alias-aware 的 match_key 解析
+    key_pairs, unresolved_keys = build_match_key_pairs(
+        match_keys=match_keys,
+        fact_fields=fact_df.columns,
+        rule_fields=rule_df.columns,
+    )
+    if unresolved_keys:
+        raise ValueError(
+            "productline_rate_lookup 存在无法解析的 match_keys: "
+            + ", ".join(key_item_to_text(x) for x in unresolved_keys)
+        )
+
+    # 输出列先建好，保证 preview 一定能看到这些列
+    ensure_object_column(fact_df, output_field)
+    for col in extra_output_fields:
+        ensure_object_column(fact_df, col)
+
+    fact_dates = ensure_datetime_column(fact_df, date_field)
+    rule_start = (
+        ensure_datetime_column(rule_df, resolved_start_field)
+        if resolved_start_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
+    )
+    rule_end = (
+        ensure_datetime_column(rule_df, resolved_end_field)
+        if resolved_end_field else pd.Series([pd.NaT] * len(rule_df), index=rule_df.index)
+    )
 
     for idx in fact_df.index:
         matched = rule_df.copy()
 
-        for key in match_keys:
-            if key not in fact_df.columns or key not in matched.columns:
-                continue
+        # 1. 先按 match_keys 过滤
+        for fact_field, rule_field in key_pairs:
             matched = matched[
-                normalize_join_key_series(matched[key]) ==
-                safe_str(fact_df.at[idx, key])
+                normalize_join_key_series(matched[rule_field]) ==
+                safe_str(fact_df.at[idx, fact_field])
                 ]
 
+        # 2. 再按时间有效期过滤
         current_date = fact_dates.loc[idx]
-        if pd.notna(current_date) and start_field and end_field:
+        if pd.notna(current_date) and resolved_start_field and resolved_end_field:
             matched = matched[(rule_start <= current_date) & (rule_end >= current_date)]
 
         if matched.empty:
             continue
 
-        selected = None
-
-        if ladder_flag_field and ladder_flag_field in matched.columns:
-            ladder_rows = matched[matched[ladder_flag_field].apply(truthy_flag)]
-            non_ladder_rows = matched[~matched[ladder_flag_field].apply(truthy_flag)]
+        # 3. 按 是否阶梯提点 分支
+        if resolved_ladder_flag_field and resolved_ladder_flag_field in matched.columns:
+            flag_series = matched[resolved_ladder_flag_field].apply(parse_ladder_flag)
+            ladder_rows = matched[flag_series == True]
+            non_ladder_rows = matched[flag_series == False]
+            unknown_flag_rows = matched[flag_series.isna()]
         else:
-            ladder_rows = matched
+            ladder_rows = pd.DataFrame(columns=matched.columns)
             non_ladder_rows = pd.DataFrame(columns=matched.columns)
+            unknown_flag_rows = matched
 
-        if not ladder_rows.empty and threshold_base_field and threshold_base_field in fact_df.columns:
-            ladder_hit = filter_by_ladder_bounds(
-                ladder_rows,
-                fact_df.at[idx, threshold_base_field],
-                threshold_min_field,
-                threshold_max_field,
-                lower_operator=lower_operator,
-                upper_operator=upper_operator,
+        # 4. 同一候选集合既有阶梯又有非阶梯 => 歧义
+        if not ladder_rows.empty and not non_ladder_rows.empty:
+            current_values = [safe_str(fact_df.at[idx, fact_field]) for fact_field, _ in key_pairs]
+            raise ValueError(
+                f"productline_rate_lookup 命中歧义: source_sheet={source_sheet}, "
+                f"match_keys={[f'{a}->{b}' if a != b else a for a, b in key_pairs]}, "
+                f"当前主表值={current_values}。"
+                f"同一候选集合中同时存在 是否阶梯提点=是 和 是否阶梯提点=否，"
+                f"无法判断当前记录应走固定系数还是阶梯规则，请补充更多 match_keys。"
             )
-            if not ladder_hit.empty:
-                selected = ladder_hit.iloc[0]
 
-        if selected is None and not non_ladder_rows.empty:
+        selected = None
+        selected_flag: Optional[bool] = None
+
+        # 5. 非阶梯：直接取固定系数
+        if not non_ladder_rows.empty:
+            if len(non_ladder_rows) > 1:
+                non_ladder_unique = non_ladder_rows[[resolved_output_field]].drop_duplicates()
+                if len(non_ladder_unique) > 1:
+                    raise ValueError(
+                        f"productline_rate_lookup 固定系数命中不唯一: source_sheet={source_sheet}, "
+                        f"match_keys={[f'{a}->{b}' if a != b else a for a, b in key_pairs]}"
+                    )
             selected = non_ladder_rows.iloc[0]
+            selected_flag = False
 
-        if selected is None and not matched.empty:
-            selected = matched.iloc[0]
+        # 6. 阶梯：按当前行 threshold_base_field 做区间判断
+        elif not ladder_rows.empty:
+            current_base_value = pd.to_numeric(
+                pd.Series([fact_df.at[idx, resolved_threshold_base_field]]),
+                errors="coerce"
+            ).iloc[0]
+
+            if pd.notna(current_base_value):
+                ladder_hit = filter_by_ladder_bounds(
+                    ladder_rows,
+                    current_base_value,
+                    resolved_threshold_min_field,
+                    resolved_threshold_max_field,
+                    lower_operator=lower_operator,
+                    upper_operator=upper_operator,
+                )
+
+                if len(ladder_hit) > 1:
+                    ladder_unique = ladder_hit[[resolved_output_field]].drop_duplicates()
+                    if len(ladder_unique) > 1:
+                        raise ValueError(
+                            f"productline_rate_lookup 阶梯命中不唯一: source_sheet={source_sheet}, "
+                            f"match_keys={[f'{a}->{b}' if a != b else a for a, b in key_pairs]}"
+                        )
+
+                if not ladder_hit.empty:
+                    selected = ladder_hit.iloc[0]
+                    selected_flag = True
+
+        # 7. flag 无法识别时兜底
+        elif not unknown_flag_rows.empty:
+            selected = unknown_flag_rows.iloc[0]
+            selected_flag = None
 
         if selected is None:
             continue
 
-        if output_field in selected.index:
-            fact_df.at[idx, output_field] = selected[output_field]
+        # 8. 只回填当前行，禁止整组回填
+        fact_df.at[idx, output_field] = selected[resolved_output_field]
 
-        for col in extra_output_fields:
-            if col in selected.index:
-                fact_df.at[idx, col] = selected[col]
+        for raw_col, resolved_col in extra_output_pairs:
+            if resolved_col in selected.index:
+                fact_df.at[idx, raw_col] = selected[resolved_col]
 
     logic_parts = []
-    if match_keys:
-        logic_parts.append(f"按{'+'.join(match_keys)}匹配产品线规则")
-    if start_field and end_field:
+    if key_pairs:
+        logic_parts.append(
+            "按" + "+".join([f"{fact_field}={rule_field}" for fact_field, rule_field in key_pairs]) + "匹配产品线规则"
+        )
+    if resolved_start_field and resolved_end_field:
         logic_parts.append("按生效失效区间过滤")
-    if ladder_flag_field:
-        logic_parts.append(f"依据{ladder_flag_field}判断是否阶梯提点")
-    if threshold_min_field and threshold_base_field:
-        logic_parts.append(f"{threshold_base_field} {lower_operator} {threshold_min_field}")
-    if threshold_max_field and threshold_base_field:
-        logic_parts.append(f"{threshold_base_field} {upper_operator} {threshold_max_field}")
+    if resolved_ladder_flag_field:
+        logic_parts.append(
+            f"先判{resolved_ladder_flag_field}："
+            f"仅命中否则直接取固定系数；"
+            f"仅命中是则按阶梯上下限匹配；"
+            f"同一候选集合若同时出现是/否则报歧义"
+        )
+    logic_parts.append(f"阶梯场景按当前行{resolved_threshold_base_field}匹配")
+    if resolved_threshold_min_field:
+        logic_parts.append(f"{resolved_threshold_base_field} {lower_operator} {resolved_threshold_min_field}")
+    if resolved_threshold_max_field:
+        logic_parts.append(f"{resolved_threshold_base_field} {upper_operator} {resolved_threshold_max_field}")
     logic_parts.append(f"输出{output_field}")
 
     lineage.append({
@@ -1445,15 +1767,14 @@ def execute_productline_rate_lookup(
         "logic": "；".join(logic_parts)
     })
 
-    for col in extra_output_fields:
+    for raw_col in extra_output_fields:
         lineage.append({
-            "field": col,
+            "field": raw_col,
             "source_sheet": source_sheet,
-            "logic": f"按产品线规则回填{col}"
+            "logic": f"按产品线规则回填{raw_col}"
         })
 
     return fact_df
-
 
 def execute_formula(
         fact_df: pd.DataFrame,
@@ -1499,18 +1820,6 @@ def compute_stats(df: pd.DataFrame) -> Dict[str, Any]:
 # =========================
 # 查询工具
 # =========================
-def normalize_filters_payload(filters: Any) -> Dict[str, Any]:
-    """
-    Dify 已经把 filters 转成 filters_obj 后传入，这里做兜底标准化。
-    支持：
-    1. dict -> 直接返回
-    2. 其他 -> 返回 {}
-    """
-    if isinstance(filters, dict):
-        return filters
-    return {}
-
-
 def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     if not filters:
         return df
@@ -1622,38 +1931,24 @@ def query_metric(
     need_rows = bool(payload.get("need_rows", True))
     need_breakdown = bool(payload.get("need_breakdown", True))
     need_lineage = bool(payload.get("need_lineage", False))
-
-    filters = normalize_filters_payload(payload.get("filters", {}))
-    group_by = payload.get("group_by", []) or []
-    result_grain = payload.get("result_grain", []) or []
+    filters = payload.get("filters", {}) or {}
 
     filtered = apply_filters(df, filters)
 
-    effective_group_by = group_by if group_by else result_grain
-    effective_group_by = select_existing_columns(filtered, effective_group_by)
-
-    if effective_group_by:
-        result_df = aggregate_df(filtered, effective_group_by, metrics)
-    else:
-        result_df = filtered.copy()
-
     summary: Dict[str, Any] = {}
     for m in metrics:
-        if m in result_df.columns:
-            summary[m] = float(pd.to_numeric(result_df[m], errors="coerce").sum())
+        if m in filtered.columns:
+            summary[m] = float(pd.to_numeric(filtered[m], errors="coerce").sum())
 
     rows: List[Dict[str, Any]] = []
-    if need_rows and not result_df.empty:
-        keep_cols = effective_group_by + metrics
-        keep_cols = [c for c in keep_cols if c in result_df.columns]
-
-        if not keep_cols:
+    if need_rows:
+        keep_cols = []
+        if not filtered.empty:
             base_cols = ["统计年月", "销售", "客户名称"] + metrics
-            keep_cols = [c for c in base_cols if c in result_df.columns]
-
-        rows = normalize_records(
-            result_df[keep_cols].head(100).to_dict(orient="records")
-        ) if keep_cols else []
+            keep_cols = [c for c in base_cols if c in filtered.columns]
+            if not keep_cols:
+                keep_cols = list(filtered.columns[:10])
+        rows = normalize_records(filtered[keep_cols].head(100).to_dict(orient="records")) if keep_cols else []
 
     breakdown: List[Dict[str, Any]] = []
     if need_breakdown and not filtered.empty:
@@ -1666,8 +1961,7 @@ def query_metric(
         "summary": to_jsonable(summary),
         "rows": rows,
         "breakdown": breakdown,
-        "warnings": [],
-        "effective_group_by": effective_group_by
+        "warnings": []
     }
 
     if need_lineage:
@@ -1680,7 +1974,7 @@ def query_metric(
 def query_ranking(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
     group_by = payload.get("group_by", []) or []
-    filters = normalize_filters_payload(payload.get("filters", {}))
+    filters = payload.get("filters", {}) or {}
     sort_by = payload.get("sort_by", []) or []
     top_n = payload.get("top_n")
     need_rows = bool(payload.get("need_rows", True))
@@ -1723,7 +2017,7 @@ def query_ranking(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_trend(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = normalize_filters_payload(payload.get("filters", {}))
+    filters = payload.get("filters", {}) or {}
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)
@@ -1762,7 +2056,7 @@ def query_trend(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_compare(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = normalize_filters_payload(payload.get("filters", {}))
+    filters = payload.get("filters", {}) or {}
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)
@@ -1783,7 +2077,7 @@ def query_compare(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def query_breakdown(df: pd.DataFrame, payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = payload.get("metrics", []) or []
-    filters = normalize_filters_payload(payload.get("filters", {}))
+    filters = payload.get("filters", {}) or {}
     group_by = payload.get("group_by", []) or []
 
     filtered = apply_filters(df, filters)
@@ -1979,6 +2273,15 @@ async def build_model(payload: Dict[str, Any]):
     payload_for_validation["formulas"] = formulas
 
     validation = validate_model_request(payload_for_validation, parsed_workbook)
+
+    if not validation["is_valid"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "模型构建请求校验失败，已拒绝生成不可执行模型",
+                "validation": validation
+            }
+        )
 
     plan_id = gen_plan_id()
     model_id = gen_model_id()
